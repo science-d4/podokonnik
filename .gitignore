@@ -1,0 +1,21 @@
+# Build and local reports
+.build/
+dist/
+.scratch/
+.local-history/
+
+# macOS and editor state
+.DS_Store
+.idea/
+.vscode/
+*.xcuserstate
+xcuserdata/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
