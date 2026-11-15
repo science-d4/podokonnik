@@ -204,7 +204,23 @@ private final class LifecycleChecks {
         updates.state = .on
         try sendAction(updates)
         try verify(controller.automaticUpdatesEnabled, "the checkbox must re-enable automatic updates")
-        log("PASS updates: checkbox controls automatic update preference")
+        controller.settingsTabControl?.selectedSegment = 2
+        try sendAction(controller.settingsTabControl)
+        let controls = descendants(controller.popover.contentViewController?.view)
+        guard let version = controls.compactMap({ $0 as? NSTextField }).first(where: { $0.identifier?.rawValue == "currentVersion" }),
+              let status = controls.compactMap({ $0 as? NSTextField }).first(where: { $0.identifier?.rawValue == "updateStatus" }),
+              let check = controls.compactMap({ $0 as? NSButton }).first(where: { $0.identifier?.rawValue == "checkUpdates" }) else {
+            throw LifecycleFailure(description: "Update tab controls are missing")
+        }
+        try verify(version.stringValue.hasPrefix("Текущая версия:"), "update tab must show the running version")
+        try verify(status.stringValue == UpdateStatus.unknown.description, "update tab starts with an unknown status")
+        try sendAction(check)
+        try verify(status.stringValue == UpdateStatus.failed.description, "manual check must update the visible status")
+        controller.popover.contentViewController?.view.layoutSubtreeIfNeeded()
+        if let content = controller.popover.contentViewController?.view { try saveOwnView(content, name: "settings-updates.png") }
+        controller.settingsTabControl?.selectedSegment = 0
+        try sendAction(controller.settingsTabControl)
+        log("PASS updates: tab, version, status, manual check and automatic preference")
 
         controller.changedSettings()
         controller.changedSettings()

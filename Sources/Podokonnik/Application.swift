@@ -148,6 +148,8 @@ final class ApplicationController: NSObject, NSApplicationDelegate, NSPopoverDel
     var permissionLabel: NSTextField?
     var settingsTabControl: ActionSegment?
     var decorationControls: [String: NSButton] = [:]
+    private var updateStatusLabel: NSTextField?
+    private var installUpdateButton: ActionButton?
     var clearControl: ActionButton?
     private var settingsPages: [NSScrollView] = []
     private var hudTools: [SnowTool] = []
@@ -203,6 +205,7 @@ final class ApplicationController: NSObject, NSApplicationDelegate, NSPopoverDel
         policy.userPaused = settings.paused
         if smokeSeconds == nil {
             updateController = UpdateController()
+            updateController?.onStatusChange = { [weak self] status in self?.showUpdateStatus(status) }
             updateController?.start()
         }
         setupMenu(); observeSystem(); rebuildDisplays()
@@ -554,8 +557,7 @@ final class ApplicationController: NSObject, NSApplicationDelegate, NSPopoverDel
         infoLabel = textLabel("Снег запускается…", size: 11, secondary: true)
         let quit = ActionButton("Завершить", symbol: "power") { NSApp.terminate(nil) }
         let snow = verticalStack([section("Снегопад"), intensityControl!, windHeader, wind, sliders, screenshotPause,
-                                  section("Уборка трактором"), plowControls, plowSpeedHeader, plowSpeedSlider!, economy,
-                                  section("Обновления"), automaticUpdates], spacing: 10)
+                                  section("Уборка трактором"), plowControls, plowSpeedHeader, plowSpeedSlider!, economy], spacing: 10)
         var decorationRows: [NSView] = [section("Праздничное настроение")]
         for (id, label, hint, _) in Self.decorationFields {
             let checkbox = NSButton(checkboxWithTitle: label, target: self, action: #selector(toggleDecoration(_:)))
@@ -572,7 +574,23 @@ final class ApplicationController: NSObject, NSApplicationDelegate, NSPopoverDel
         }
         let decorations = verticalStack(decorationRows, spacing: 16)
         for row in decorationRows { row.widthAnchor.constraint(equalTo: decorations.widthAnchor).isActive = true }
-        settingsPages = [scrollingPage(snow), scrollingPage(decorations)]
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "—"
+        let currentVersion = textLabel("Текущая версия: \(version)")
+        currentVersion.identifier = NSUserInterfaceItemIdentifier("currentVersion")
+        updateStatusLabel = textLabel((updateController?.status ?? .unknown).description, secondary: true)
+        updateStatusLabel?.identifier = NSUserInterfaceItemIdentifier("updateStatus")
+        let checkUpdates = ActionButton("Проверить обновления", symbol: "arrow.clockwise") { [weak self] in
+            self?.updateController?.checkNow()
+        }
+        checkUpdates.identifier = NSUserInterfaceItemIdentifier("checkUpdates")
+        installUpdateButton = ActionButton("Установить обновление", symbol: "arrow.down.circle") { [weak self] in
+            self?.updateController?.installUpdate()
+        }
+        installUpdateButton?.identifier = NSUserInterfaceItemIdentifier("installUpdate")
+        let updates = verticalStack([section("Обновления"), currentVersion, updateStatusLabel!,
+                                     checkUpdates, installUpdateButton!, automaticUpdates], spacing: 12)
+        showUpdateStatus(updateController?.status ?? .unknown)
+        settingsPages = [scrollingPage(snow), scrollingPage(decorations), scrollingPage(updates)]
         let pages = NSView(); pages.translatesAutoresizingMaskIntoConstraints = false
         for page in settingsPages {
             pages.addSubview(page)
@@ -581,13 +599,13 @@ final class ApplicationController: NSObject, NSApplicationDelegate, NSPopoverDel
                 page.topAnchor.constraint(equalTo: pages.topAnchor), page.bottomAnchor.constraint(equalTo: pages.bottomAnchor)
             ])
         }
-        settingsTabControl = ActionSegment(labels: ["Снег", "Украшения"], selected: 0) { [weak self] index in
+        settingsTabControl = ActionSegment(labels: ["Снег", "Украшения", "Обновления"], selected: 0) { [weak self] index in
             guard let self, self.settingsPages.indices.contains(index) else { return }
             for (i, page) in self.settingsPages.enumerated() { page.isHidden = i != index }
         }
         settingsTabControl?.identifier = NSUserInterfaceItemIdentifier("settingsTabs")
         settingsTabControl?.setAccessibilityLabel("Раздел настроек")
-        settingsPages[1].isHidden = true
+        for page in settingsPages.dropFirst() { page.isHidden = true }
         for (id, _, _, keyPath) in Self.decorationFields {
             decorationControls[id]?.state = settings.decorations[keyPath: keyPath] ? .on : .off
         }
@@ -657,6 +675,12 @@ final class ApplicationController: NSObject, NSApplicationDelegate, NSPopoverDel
 
     @objc private func toggleAutomaticUpdates(_ button: NSButton) {
         updateController?.setAutomaticUpdatesEnabled(button.state == .on)
+    }
+
+    private func showUpdateStatus(_ status: UpdateStatus) {
+        updateStatusLabel?.stringValue = status.description
+        if case .available = status { installUpdateButton?.isHidden = false }
+        else { installUpdateButton?.isHidden = true }
     }
 
     @objc private func toggleEconomy(_ button: NSButton) { settings.economy = button.state == .on; changedSettings() }

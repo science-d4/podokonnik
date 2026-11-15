@@ -16,6 +16,28 @@ final class FixtureDelegate: NSObject, NSApplicationDelegate {
         let arguments = CommandLine.arguments
         if arguments.contains("--disable-updates") { updater?.setAutomaticUpdatesEnabled(false) }
         if arguments.contains("--enable-updates") { updater?.setAutomaticUpdatesEnabled(true) }
+        if arguments.contains("--check-info") {
+            guard updater?.automaticUpdatesEnabled == false else { exit(1) }
+            var foundCount = 0
+            updater?.onStatusChange = { status in
+                let result: String
+                switch status {
+                case .available(let available):
+                    foundCount += 1
+                    guard foundCount >= 2 else { return }
+                    result = "available:\(available)"
+                case .noUpdate: result = "no-update"
+                case .failed: result = "failed"
+                default: return
+                }
+                try? Data(result.utf8).write(to: URL(fileURLWithPath: marker), options: .atomic)
+                NSApp.terminate(nil)
+            }
+            updater?.start()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.updater?.checkNow() }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 20) { NSApp.terminate(nil) }
+            return
+        }
         if arguments.contains("--expect-disabled") || arguments.contains("--disable-updates") {
             guard updater?.automaticUpdatesEnabled == false else { exit(1) }
             try? Data("disabled".utf8).write(to: URL(fileURLWithPath: marker), options: .atomic)

@@ -67,6 +67,23 @@ if [ -s "$RUN/server.log" ]; then
     exit 1
 fi
 printf '%s\n' 'PASS: disabling automatic updates persists and sends no requests'
+open -n -W "$BUNDLE" --args --check-info
+[ "$(cat "$RUN/version")" = available:1.0.1 ]
+[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$BUNDLE/Contents/Info.plist")" = 1.0.0 ]
+if rg -q 'GET /Podokonnik-1.0.1.zip' "$RUN/server.log"; then
+    printf '%s\n' 'An informational check downloaded the update.' >&2
+    exit 1
+fi
+printf '%s\n' 'PASS: a manual check finds the version while automatic updates are disabled'
+/usr/libexec/PlistBuddy -c 'Set :CFBundleVersion 1.0.2' "$BUNDLE/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c 'Set :CFBundleShortVersionString 1.0.2' "$BUNDLE/Contents/Info.plist"
+codesign --force --sign - "$BUNDLE"
+open -n -W "$BUNDLE" --args --check-info
+[ "$(cat "$RUN/version")" = no-update ]
+/usr/libexec/PlistBuddy -c 'Set :CFBundleVersion 1.0.0' "$BUNDLE/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c 'Set :CFBundleShortVersionString 1.0.0' "$BUNDLE/Contents/Info.plist"
+codesign --force --sign - "$BUNDLE"
+printf '%s\n' 'PASS: a manual check reports when no update is available'
 cp "$RUN/serve/appcast.xml" "$RUN/original-appcast.xml"
 python3 - "$RUN/serve/appcast.xml" <<'PY'
 import pathlib, sys
@@ -75,6 +92,9 @@ content = path.read_bytes()
 assert b'<title>Podokonnik</title>' in content
 path.write_bytes(content.replace(b'<title>Podokonnik</title>', b'<title>Podokonnix</title>', 1))
 PY
+open -n -W "$BUNDLE" --args --check-info
+[ "$(cat "$RUN/version")" = failed ]
+printf '%s\n' 'PASS: a manual check reports a feed error'
 open -n -W "$BUNDLE" --args --enable-updates --expect-reject
 [ "$(cat "$RUN/version")" = 1.0.0 ]
 rg -q 'GET /appcast.xml' "$RUN/server.log"
