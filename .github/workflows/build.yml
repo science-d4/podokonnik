@@ -70,6 +70,10 @@ jobs:
         run: bash Scripts/build.sh
       - name: Package release
         run: bash Scripts/package-dmg.sh
+      - name: Sign update feed
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: bash Scripts/create-appcast.sh
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -92,4 +96,5 @@ jobs:
           gh release create "$RELEASE_TAG" \
             "dist/Podokonnik-$RELEASE_VERSION-arm64.dmg" \
             "dist/Podokonnik-$RELEASE_VERSION-arm64.dmg.sha256" \
+            "dist/appcast.xml" \
             --verify-tag --title "Podokonnik $RELEASE_VERSION" --generate-notes

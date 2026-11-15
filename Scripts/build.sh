@@ -10,17 +10,23 @@ if [[ ! "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; th
     exit 1
 fi
 mkdir -p .build/module-cache "$OUTPUT"
+bash Scripts/prepare-sparkle.sh
+SPARKLE="$ROOT/.build/sparkle-2.10.1"
 APP="$OUTPUT/Podokonnik.app"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/Licenses" "$APP/Contents/Frameworks"
+ditto "$SPARKLE/Sparkle.framework" "$APP/Contents/Frameworks/Sparkle.framework"
+cp "$SPARKLE/LICENSE" "$APP/Contents/Resources/Licenses/Sparkle.txt"
 SWIFT_FLAGS=(-swift-version 5 -target arm64-apple-macos14.0 -module-cache-path "$ROOT/.build/module-cache")
 source_digest() {
-    shasum -a 256 Sources/SnowCore/*.swift Sources/Podokonnik/*.swift Resources/Info.plist Scripts/GenerateIcon.swift Scripts/build.sh | shasum -a 256 | cut -d ' ' -f 1
+    shasum -a 256 Sources/SnowCore/*.swift Sources/Podokonnik/*.swift Resources/Info.plist Scripts/GenerateIcon.swift Scripts/build.sh Scripts/prepare-sparkle.sh | shasum -a 256 | cut -d ' ' -f 1
 }
 SOURCE_BEFORE="$(source_digest)"
 xcrun swiftc "${SWIFT_FLAGS[@]}" -O Scripts/GenerateIcon.swift -o .build/generate-icon
 .build/generate-icon .build/AppIcon.iconset
 iconutil -c icns .build/AppIcon.iconset -o "$APP/Contents/Resources/AppIcon.icns"
-xcrun swiftc "${SWIFT_FLAGS[@]}" -O -whole-module-optimization Sources/SnowCore/*.swift Sources/Podokonnik/*.swift -o "$APP/Contents/MacOS/Podokonnik"
+xcrun swiftc "${SWIFT_FLAGS[@]}" -O -whole-module-optimization -F "$SPARKLE" -framework Sparkle \
+    -Xlinker -rpath -Xlinker @executable_path/../Frameworks \
+    Sources/SnowCore/*.swift Sources/Podokonnik/*.swift -o "$APP/Contents/MacOS/Podokonnik"
 SOURCE_AFTER="$(source_digest)"
 if [ "$SOURCE_BEFORE" != "$SOURCE_AFTER" ]; then
     printf '%s\n' 'Sources changed during compilation; run build again.' >&2
@@ -29,11 +35,10 @@ fi
 printf '{"sourceDigest":"%s","version":"%s","architecture":"arm64","minimumOS":"14.0"}\n' "$SOURCE_AFTER" "$VERSION" > "$APP/Contents/Resources/BuildInfo.json"
 cp Resources/Info.plist "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP/Contents/Info.plist"
-if [[ -n "${PODOKONNIK_VERSION:-}" ]]; then
-    /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$APP/Contents/Info.plist"
-fi
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$APP/Contents/Info.plist"
 plutil -lint "$APP/Contents/Info.plist"
 codesign --force --sign - --identifier local.snezhno.mac "$APP"
 codesign --verify --strict --verbose=2 "$APP"
+codesign --verify --deep --strict "$APP"
 file "$APP/Contents/MacOS/Podokonnik"
 printf 'Built: %s\n' "$APP"

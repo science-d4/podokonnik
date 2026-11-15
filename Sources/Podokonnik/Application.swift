@@ -112,6 +112,8 @@ final class ApplicationController: NSObject, NSApplicationDelegate, NSPopoverDel
     let desktop = DesktopEnvironment()
     let store: SettingsStore
     var settings: AppSettings
+    private var updateController: UpdateController?
+    var automaticUpdatesEnabled: Bool { updateController?.automaticUpdatesEnabled ?? true }
     private var ownsSession = false
     private var instanceLock: ApplicationInstanceLock?
     private var cachedWeather = SnowWeather()
@@ -199,6 +201,10 @@ final class ApplicationController: NSObject, NSApplicationDelegate, NSPopoverDel
         if smokeSeconds == nil { settings = store.load() }
         NSApp.setActivationPolicy(.accessory)
         policy.userPaused = settings.paused
+        if smokeSeconds == nil {
+            updateController = UpdateController()
+            updateController?.start()
+        }
         setupMenu(); observeSystem(); rebuildDisplays()
         desktop.onSnapshot = { [weak self] snapshot in self?.receive(snapshot) }
         refreshPolicy()
@@ -522,6 +528,11 @@ final class ApplicationController: NSObject, NSApplicationDelegate, NSPopoverDel
         let screenshotPause = NSButton(checkboxWithTitle: "Пауза при скриншоте", target: self, action: #selector(toggleScreenshotPause(_:)))
         screenshotPause.state = settings.pauseForScreenshots ? .on : .off
         screenshotPause.toolTip = "Скрывать снег и украшения при выделении области в штатном «Снимке экрана»."
+        let automaticUpdates = NSButton(checkboxWithTitle: "Автоматически обновлять приложение", target: self, action: #selector(toggleAutomaticUpdates(_:)))
+        automaticUpdates.identifier = NSUserInterfaceItemIdentifier("automaticUpdates")
+        automaticUpdates.setAccessibilityIdentifier("automaticUpdates")
+        automaticUpdates.toolTip = "Проверять GitHub и устанавливать новые версии автоматически."
+        automaticUpdates.state = automaticUpdatesEnabled ? .on : .off
         let intervals = [5, 10, 30]
         let plowInterval = ActionSegment(labels: intervals.map { "\($0) мин" },
                                         selected: intervals.firstIndex(of: settings.plowIntervalMinutes) ?? 1) { [weak self] index in
@@ -543,7 +554,8 @@ final class ApplicationController: NSObject, NSApplicationDelegate, NSPopoverDel
         infoLabel = textLabel("Снег запускается…", size: 11, secondary: true)
         let quit = ActionButton("Завершить", symbol: "power") { NSApp.terminate(nil) }
         let snow = verticalStack([section("Снегопад"), intensityControl!, windHeader, wind, sliders, screenshotPause,
-                                  section("Уборка трактором"), plowControls, plowSpeedHeader, plowSpeedSlider!, economy], spacing: 10)
+                                  section("Уборка трактором"), plowControls, plowSpeedHeader, plowSpeedSlider!, economy,
+                                  section("Обновления"), automaticUpdates], spacing: 10)
         var decorationRows: [NSView] = [section("Праздничное настроение")]
         for (id, label, hint, _) in Self.decorationFields {
             let checkbox = NSButton(checkboxWithTitle: label, target: self, action: #selector(toggleDecoration(_:)))
@@ -641,6 +653,10 @@ final class ApplicationController: NSObject, NSApplicationDelegate, NSPopoverDel
               let field = Self.decorationFields.first(where: { $0.0 == id }) else { return }
         settings.decorations[keyPath: field.3] = button.state == .on
         changedSettings()
+    }
+
+    @objc private func toggleAutomaticUpdates(_ button: NSButton) {
+        updateController?.setAutomaticUpdatesEnabled(button.state == .on)
     }
 
     @objc private func toggleEconomy(_ button: NSButton) { settings.economy = button.state == .on; changedSettings() }
@@ -759,7 +775,7 @@ final class ApplicationController: NSObject, NSApplicationDelegate, NSPopoverDel
         let title = textLabel("Пусть идёт снег", size: 30, weight: .semibold)
         let intro = textLabel("Снег живёт поверх рабочего стола. В обычном режиме клики проходят в ваши приложения.", size: 15)
         let game = textLabel("Хотите поиграть? Выберите «Играть со снегом» в строке меню. Варежка смахивает снег, лопата очищает опору, снежок собирает шар. Выход — Esc.", size: 13, secondary: true)
-        let privacy = textLabel("«Универсальный доступ» помогает учитывать положение окон и Dock. «Подоконник» не читает содержимое окон, не записывает экран и не подключается к сети.", size: 13, secondary: true)
+        let privacy = textLabel("«Универсальный доступ» помогает учитывать положение окон и Dock. Приложение не читает содержимое окон и не записывает экран. Для обновлений оно подключается к GitHub; это можно отключить в настройках.", size: 13, secondary: true)
         let allow = ActionButton("Открыть настройки доступа", symbol: "lock.open") {
             DesktopEnvironment.requestAccessibility()
             if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") { NSWorkspace.shared.open(url) }

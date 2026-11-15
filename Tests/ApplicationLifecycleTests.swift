@@ -193,6 +193,19 @@ private final class LifecycleChecks {
         try verify(controller.world.drifts[support.id]?.heights == snow, "leaving economy must preserve snow too")
         log("PASS economy: actual checkbox target/action configures pacer=30 and lowPower weather; accumulated snow survives both directions")
 
+        guard let updates = descendants(controller.popover.contentViewController?.view).compactMap({ $0 as? NSButton })
+            .first(where: { $0.identifier?.rawValue == "automaticUpdates" }) else {
+            throw LifecycleFailure(description: "Automatic updates checkbox is missing")
+        }
+        try verify(updates.state == .on && controller.automaticUpdatesEnabled, "automatic updates should default to on")
+        updates.state = .off
+        try sendAction(updates)
+        try verify(!controller.automaticUpdatesEnabled, "the checkbox must disable automatic updates")
+        updates.state = .on
+        try sendAction(updates)
+        try verify(controller.automaticUpdatesEnabled, "the checkbox must re-enable automatic updates")
+        log("PASS updates: checkbox controls automatic update preference")
+
         controller.changedSettings()
         controller.changedSettings()
         try verify(identities(controller) == overlayIdentities, "repeated policy refresh must reuse all overlay instances")

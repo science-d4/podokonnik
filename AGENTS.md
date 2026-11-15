@@ -1,6 +1,6 @@
 # Repository Guidelines
 
-Подоконник (Podokonnik) — нативное приложение для Apple Silicon и macOS 14+. Стек: Swift, AppKit, Metal и SpriteKit. Сборка использует Apple Command Line Tools и macOS SDK. Сторонних зависимостей нет.
+Подоконник (Podokonnik) — нативное приложение для Apple Silicon и macOS 14+. Стек: Swift, AppKit, Metal и SpriteKit. Сборка использует Apple Command Line Tools и macOS SDK. Для обновлений используется Sparkle; первая сборка скачивает проверенный архив зависимости.
 
 ## Структура проекта
 
