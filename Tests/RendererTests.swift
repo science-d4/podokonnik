@@ -57,7 +57,8 @@ enum RendererTests {
         let negativeDisplay = CGRect(x: -1920, y: -400, width: 1920, height: 1080)
         let negativeOccluder = CGRect(x: -1200, y: -500, width: 300, height: 600)
         let negativeParts = RendererGeometry.visibleRectangles(in: negativeDisplay, subtracting: [negativeOccluder])
-        check(negativeParts.reduce(0) { $0 + $1.width * $1.height } == 1920 * 1080 - 300 * 500, "negative display coordinates and partial intersection")
+        let visibleArea: CGFloat = negativeParts.reduce(0) { $0 + $1.width * $1.height }
+        check(visibleArea == 1_923_600, "negative display coordinates and partial intersection")
         check(negativeParts.allSatisfy { negativeDisplay.contains($0) }, "mask stays inside display")
 
         let neighboringDisplay = CGRect(x: 0, y: 0, width: 180, height: 120)
