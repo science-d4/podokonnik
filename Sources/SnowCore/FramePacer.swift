@@ -12,6 +12,11 @@ struct FramePacer {
         didSet { if oldValue != rate { reset() } }
     }
     private var nextDeadline: Double?
+
+    init(rate: Double = 60) {
+        self.rate = rate
+    }
+
     mutating func reset() { nextDeadline = nil }
     mutating func shouldRender(at time: Double) -> Bool {
         guard time.isFinite, rate.isFinite, rate > 0 else { return false }
