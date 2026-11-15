@@ -4,6 +4,11 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 OUTPUT="${1:-$ROOT/dist}"
 if [[ "$OUTPUT" != /* ]]; then OUTPUT="$ROOT/$OUTPUT"; fi
+VERSION="${PODOKONNIK_VERSION:-$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Resources/Info.plist)}"
+if [[ ! "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+    printf 'Invalid version: %s\n' "$VERSION" >&2
+    exit 1
+fi
 mkdir -p .build/module-cache "$OUTPUT"
 APP="$OUTPUT/Podokonnik.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -21,8 +26,12 @@ if [ "$SOURCE_BEFORE" != "$SOURCE_AFTER" ]; then
     printf '%s\n' 'Sources changed during compilation; run build again.' >&2
     exit 1
 fi
-printf '{"sourceDigest":"%s","version":"1.7.1","architecture":"arm64","minimumOS":"14.0"}\n' "$SOURCE_AFTER" > "$APP/Contents/Resources/BuildInfo.json"
+printf '{"sourceDigest":"%s","version":"%s","architecture":"arm64","minimumOS":"14.0"}\n' "$SOURCE_AFTER" "$VERSION" > "$APP/Contents/Resources/BuildInfo.json"
 cp Resources/Info.plist "$APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP/Contents/Info.plist"
+if [[ -n "${PODOKONNIK_VERSION:-}" ]]; then
+    /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$APP/Contents/Info.plist"
+fi
 plutil -lint "$APP/Contents/Info.plist"
 codesign --force --sign - --identifier local.snezhno.mac "$APP"
 codesign --verify --strict --verbose=2 "$APP"

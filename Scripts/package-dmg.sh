@@ -9,7 +9,12 @@ STAGE="$(mktemp -d "$ROOT/.build/dmg-stage.XXXXXX")"
 ditto "$APP" "$STAGE/Podokonnik.app"
 ln -s /Applications "$STAGE/Applications"
 cp Resources/Installation-ru.txt "$STAGE/Установка.txt"
-DMG="$ROOT/dist/Podokonnik-1.7.1-arm64.dmg"
+VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")"
+if [[ ! "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+    printf 'Invalid application version: %s\n' "$VERSION" >&2
+    exit 1
+fi
+DMG="$ROOT/dist/Podokonnik-$VERSION-arm64.dmg"
 hdiutil create -volname 'Подоконник' -srcfolder "$STAGE" -ov -format UDZO -fs HFS+ "$DMG"
 hdiutil verify "$DMG"
 (cd "$ROOT/dist" && shasum -a 256 "$(basename "$DMG")") > "$DMG.sha256"
