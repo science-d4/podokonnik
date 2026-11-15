@@ -124,11 +124,9 @@ final class FestiveLayer: SKNode {
 
     private func updateWindowGarlands(options: FestiveOptions, snow: SnowWorld, display: CGRect, weather: SnowWeather) {
         guard options.windowGarlands else { windowWires.values.forEach { $0.isHidden = true }; return }
-        // Small windows include text-correction panels; keep their existing
-        // occlusion and snow behavior but do not attach a garland to them.
         let surfaces = Array(snow.surfaces.filter {
             $0.kind == .window && $0.isVisible && $0.frame.intersects(display)
-                && $0.frame.width >= 160 && $0.frame.height >= 100
+                && SnowSurface.meetsWindowSupportSize($0.frame)
         }.prefix(32))
         let ids = Set(surfaces.map(\.id))
         for id in Array(windowWires.keys) where !ids.contains(id) { windowWires.removeValue(forKey: id)?.removeFromParent() }

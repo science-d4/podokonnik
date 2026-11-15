@@ -20,7 +20,37 @@ enum AppKitTests {
         precondition(button.accessibilityTitle() == "Продолжить", "VoiceOver title follows the actual action")
         window.receivesGameInput = false; window.ignoresMouseEvents = true
         precondition(!window.canBecomeKey && !window.canBecomeMain && window.ignoresMouseEvents)
+        verifyWindPad(in: window)
         window.close()
-        print("AppKit: Escape with focused HUD, accessible title and passive window checks passed")
+        print("AppKit: Escape, accessible title, passive window and wind guide contrast passed")
+    }
+
+    private static func verifyWindPad(in window: NSWindow) {
+        let pad = WindPad(frame: CGRect(x: 0, y: 0, width: 312, height: 102))
+        pad.vector = .zero
+        window.contentView?.addSubview(pad)
+        for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+            pad.appearance = NSAppearance(named: appearance)
+            let bitmap = pad.bitmapImageRepForCachingDisplay(in: pad.bounds)!
+            pad.cacheDisplay(in: pad.bounds, to: bitmap)
+            let scale = CGFloat(bitmap.pixelsWide) / pad.bounds.width
+            func brightness(x: CGFloat, y: CGFloat) -> CGFloat {
+                let color = bitmap.colorAt(x: Int(x * scale), y: Int(y * scale))!.usingColorSpace(.deviceRGB)!
+                return (color.redComponent + color.greenComponent + color.blueComponent) / 3
+            }
+            for radius in [18.36, 36.72] {
+                let visibleSamples = (0..<180).filter { degrees in
+                    let angle = CGFloat(degrees) * .pi / 180
+                    let x = pad.bounds.midX + cos(angle) * radius
+                    let y = pad.bounds.midY + sin(angle) * radius
+                    let backgroundX = pad.bounds.midX + cos(angle) * (radius + 4)
+                    let backgroundY = pad.bounds.midY + sin(angle) * (radius + 4)
+                    return abs(brightness(x: x, y: y) - brightness(x: backgroundX, y: backgroundY)) > 0.20
+                }
+                guard visibleSamples.count > 24 else {
+                    fatalError("Wind guide at radius \(radius) has only \(visibleSamples.count) visible samples in \(appearance)")
+                }
+            }
+        }
     }
 }

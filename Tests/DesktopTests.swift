@@ -651,6 +651,12 @@ struct DesktopTests {
         let shield = Int(CGWindowLevelForKey(.assistiveTechHighWindow)) - 2
         expect(DesktopGeometry.canBeScreenshotWindow(layer: shield, frame: display, displays: [display]),
                "the system region-selection shield is a screenshot owner candidate")
+        let thumbnail = CGRect(x: display.maxX - 220, y: display.minY + 24, width: 196, height: 126)
+        expect(!DesktopGeometry.canBeScreenshotWindow(layer: shield, frame: thumbnail, displays: [display]),
+               "a floating preview at the selection layer must not keep screenshot pause active")
+        let helper = CGRect(x: display.minX, y: display.minY, width: 8, height: 8)
+        expect(!DesktopGeometry.canBeScreenshotWindow(layer: shield + 1, frame: helper, displays: [display]),
+               "a small helper at the selection layer must not keep screenshot pause active")
     }
 
     private static func hiddenWindowSupports() {

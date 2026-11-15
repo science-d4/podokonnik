@@ -39,10 +39,14 @@ private final class FixtureDelegate: NSObject, NSApplicationDelegate {
         let frames: [(String, CGRect)] = [
             ("A", CGRect(x: origin.x, y: origin.y, width: 360, height: 200)),
             ("B", CGRect(x: origin.x + 100, y: origin.y + 65, width: 320, height: 190)),
-            ("C", CGRect(x: origin.x + 180, y: origin.y + 25, width: 250, height: 200))
+            ("C", CGRect(x: origin.x + 180, y: origin.y + 25, width: 250, height: 200)),
+            ("Panel", CGRect(x: origin.x + 35, y: origin.y + 120, width: 143, height: 52))
         ]
         for (name, frame) in frames {
-            let window = FixtureWindow(contentRect: frame, styleMask: [.titled, .closable, .miniaturizable, .resizable, .nonactivatingPanel],
+            // AppKit's text-correction panel has regular-window level and these bounds.
+            let style: NSWindow.StyleMask = name == "Panel" ? [.borderless, .nonactivatingPanel]
+                : [.titled, .closable, .miniaturizable, .resizable, .nonactivatingPanel]
+            let window = FixtureWindow(contentRect: frame, styleMask: style,
                                        backing: .buffered, defer: false)
             window.title = "Подоконник · тестовое окно \(name)"
             window.isReleasedWhenClosed = false
@@ -129,7 +133,7 @@ private final class FixtureDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func emit(_ stage: String) {
-        let state = FixtureState(stage: stage, pid: getpid(), windows: ["A", "B", "C"].compactMap { name in
+        let state = FixtureState(stage: stage, pid: getpid(), windows: ["A", "B", "C", "Panel"].compactMap { name in
             guard let window = windows[name], let id = ids[name] else { return nil }
             let frame = window.frame
             return FixtureWindowState(name: name, id: id, x: Double(frame.minX), y: Double(frame.minY),

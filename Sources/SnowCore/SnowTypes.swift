@@ -31,6 +31,11 @@ enum SurfaceKind: String { case window, dock, floor }
 
 /// World coordinates match AppKit: points, origin at the primary display's bottom left.
 struct SnowSurface {
+    /// Small system panels can share the owning app and layer of regular windows.
+    static func meetsWindowSupportSize(_ frame: CGRect) -> Bool {
+        frame.width >= 160 && frame.height >= 100
+    }
+
     var id: String
     var frame: CGRect
     var kind: SurfaceKind

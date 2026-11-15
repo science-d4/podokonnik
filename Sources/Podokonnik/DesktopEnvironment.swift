@@ -606,7 +606,7 @@ private enum DesktopCapture {
         let screenshotOwners = screenshotCandidates.filter(isScreenshotOwner(pid:))
         func isOrdinary(_ record: DesktopWindowRecord) -> Bool {
             record.pid != context.ownPID && record.layer == 0 && context.supportPIDs.contains(record.pid)
-                && record.frame.width >= 80 && record.frame.height >= 40 && record.alpha >= 0.8
+                && SnowSurface.meetsWindowSupportSize(record.frame) && record.alpha >= 0.8
         }
         let activeID = DesktopGeometry.activeWindowID(
             ordered: records.filter(isOrdinary).map { (id: $0.id, pid: $0.pid) }, frontmostPID: context.frontmostPID)
@@ -731,11 +731,10 @@ enum DesktopGeometry {
 
     static func canBeScreenshotWindow(layer: Int, frame: CGRect, displays: [CGRect]) -> Bool {
         let assistiveLevel = Int(CGWindowLevelForKey(.assistiveTechHighWindow))
-        // Screenshot uses windows just below the assistive UI, and an
-        // almost-full-display window at menu-bar level for region selection.
-        return (assistiveLevel - 2...assistiveLevel).contains(layer)
-            || (layer == Int(CGWindowLevelForKey(.mainMenuWindow))
-                && displays.contains { coversDisplay(frame.insetBy(dx: -8, dy: -8), $0) })
+        guard (assistiveLevel - 2...assistiveLevel).contains(layer)
+                || layer == Int(CGWindowLevelForKey(.mainMenuWindow)) else { return false }
+        // A small window owned by Screenshot can outlive the selection canvas.
+        return displays.contains { coversDisplay(frame.insetBy(dx: -8, dy: -8), $0) }
     }
 
     /// CG's public front-to-back order also changes when switching two normal

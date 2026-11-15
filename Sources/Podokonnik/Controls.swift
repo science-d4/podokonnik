@@ -62,9 +62,10 @@ final class WindPad: NSView {
         NSBezierPath(roundedRect: area, xRadius: 12, yRadius: 12).fill()
         let center = CGPoint(x: bounds.midX, y: bounds.midY)
         let r = min(bounds.width, bounds.height) * 0.36
-        NSColor.separatorColor.setStroke()
+        NSColor.secondaryLabelColor.setStroke()
         for scale: CGFloat in [0.5, 1] {
             let p = NSBezierPath(ovalIn: CGRect(x: center.x-r*scale, y: center.y-r*scale, width: 2*r*scale, height: 2*r*scale))
+            p.lineWidth = 1.5
             p.setLineDash([2, 4], count: 2, phase: 0); p.stroke()
         }
         let dot = CGPoint(x: center.x + vector.dx*r, y: center.y + vector.dy*r)

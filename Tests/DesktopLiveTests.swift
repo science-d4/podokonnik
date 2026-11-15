@@ -100,6 +100,14 @@ private final class DesktopLiveRunner {
         }
         for window in expected.windows {
             let actual = surface(window.name)
+            if window.name == "Panel" {
+                guard actual == nil, !snapshot.hiddenWindowSupportIDs.contains(prefix + String(window.id)),
+                      surface("A")?.bodyOccluders.contains(where: { near($0, window.frame) }) == true else {
+                    lastProblem = "the small correction panel must mask A without creating a support"
+                    return
+                }
+                continue
+            }
             if window.visible {
                 guard let actual, near(actual.frame, window.frame) else {
                     lastProblem = "visible window \(window.name) missing or bounds differ"
@@ -110,7 +118,7 @@ private final class DesktopLiveRunner {
                 return
             }
         }
-        let visibleCount = expected.windows.filter(\.visible).count
+        let visibleCount = expected.windows.filter { $0.visible && $0.name != "Panel" }.count
         guard surfaces.count == visibleCount else {
             lastProblem = "unexpected number of own fixture surfaces"
             return
