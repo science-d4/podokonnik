@@ -480,21 +480,33 @@ final class SnowWorld {
         // Lower balls update first, so supported balls inherit a stable position.
         let ordered = balls.indices.sorted { balls[$0].position.y < balls[$1].position.y }
         var escaped = Set<UUID>()
-        let bounds = connectedRegions.reduce(CGRect.null) { $0.union($1) }
+        let physicalRegions = connectedRegions.isEmpty ? regions : connectedRegions
+        let bounds = physicalRegions.reduce(CGRect.null) { $0.union($1) }
+        func distanceSquared(_ point: CGPoint, to rect: CGRect) -> CGFloat {
+            let dx = max(rect.minX - point.x, 0, point.x - rect.maxX)
+            let dy = max(rect.minY - point.y, 0, point.y - rect.maxY)
+            return dx * dx + dy * dy
+        }
         for index in ordered {
             var ball = balls[index]
             guard ball.id != dragID else { continue }
             if let sid = ball.surfaceID, let surface = drifts[sid]?.surface, !surface.isVisible { continue }
-            if ball.surfaceID == nil && !bounds.isNull && (ball.position.y + ball.radius < bounds.minY - 8 ||
-                ball.position.x + ball.radius < bounds.minX - 8 || ball.position.x - ball.radius > bounds.maxX + 8) {
+            // Use the same ball-sized boundary as the active-region check below.
+            // A separate margin would freeze the ball before it could reach it.
+            if ball.surfaceID == nil && !bounds.isNull && (ball.position.y + ball.radius <= bounds.minY ||
+                ball.position.x + ball.radius <= bounds.minX || ball.position.x - ball.radius >= bounds.maxX) {
                 escaped.insert(ball.id)
                 continue
             }
-            let active = regions.contains { $0.insetBy(dx: -ball.radius, dy: -ball.radius).contains(ball.position) }
-            guard active else {
-                if ball.surfaceID == nil && regions.contains(where: { ball.position.x >= $0.minX && ball.position.x <= $0.maxX }) &&
-                    ball.position.y + ball.radius < (regions.map(\.minY).min() ?? 0) - 8 { escaped.insert(ball.id) }
-                continue
+            if !regions.contains(where: { $0.insetBy(dx: -ball.radius, dy: -ball.radius).contains(ball.position) }) {
+                // A ball on a connected inactive screen is paused. A free ball in
+                // the gap or above screens keeps moving only while its nearest
+                // physical screen is active, so it can return or cross the gap.
+                guard ball.surfaceID == nil,
+                      !physicalRegions.contains(where: { $0.insetBy(dx: -ball.radius, dy: -ball.radius).contains(ball.position) }),
+                      let activeDistance = regions.map({ distanceSquared(ball.position, to: $0) }).min(),
+                      let physicalDistance = physicalRegions.map({ distanceSquared(ball.position, to: $0) }).min(),
+                      activeDistance <= physicalDistance else { continue }
             }
             if let supportID = supportedBy[ball.id], let support = balls.first(where: { $0.id == supportID }),
                supportID != dragID, let sid = support.surfaceID, abs(ball.position.x - support.position.x) <= support.radius * 0.25 + 0.5 {

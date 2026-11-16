@@ -3,6 +3,43 @@ import Foundation
 @main
 enum FramePacerTests {
     static func main() {
+        precondition(FramePacer.driverID(displays: [], isMoving: true, constrained: false) == nil)
+        precondition(FramePacer.driverID(displays: [(id: 1, nativeMaximum: 60), (id: 2, nativeMaximum: 120)], isMoving: true, constrained: false) == 2,
+                     "a slower display with a lower ID must not limit the shared world")
+        precondition(FramePacer.driverID(displays: [(id: 7, nativeMaximum: 120), (id: 2, nativeMaximum: 120)], isMoving: true, constrained: false) == 2,
+                     "displays with equal refresh rates select a stable driver")
+        precondition(FramePacer.driverID(displays: [(id: 1, nativeMaximum: 60)], isMoving: true, constrained: false) == 1,
+                     "the remaining active display drives the world")
+        let mixed = [(id: UInt32(1), nativeMaximum: 120), (id: UInt32(2), nativeMaximum: 144)]
+        guard let motionID = FramePacer.driverID(displays: mixed, isMoving: true, constrained: false),
+              let motionScreen = mixed.first(where: { $0.id == motionID }) else {
+            preconditionFailure("a clock must be selected")
+        }
+        var sharedClock = FramePacer(rate: 120)
+        let delivered = (0..<(motionScreen.nativeMaximum * 2)).compactMap { tick -> Double? in
+            let timestamp = Double(tick) / Double(motionScreen.nativeMaximum)
+            return sharedClock.shouldRender(at: timestamp) ? timestamp : nil
+        }
+        let longest = zip(delivered.dropFirst(), delivered).map(-).max() ?? .infinity
+        precondition(delivered.count == 240 && longest <= 1.0 / 120 + 0.000_001,
+                     "the shared clock must deliver 120 equally spaced updates on 120/144 Hz displays")
+        precondition(FramePacer.driverID(displays: mixed, isMoving: false, constrained: false) == 1,
+                     "idle 60 FPS should also use the display with a regular cadence")
+        precondition(FramePacer.driverID(displays: mixed, isMoving: true, constrained: true) == 1,
+                     "the 30 FPS power limit must be included in driver selection")
+        precondition(FramePacer.driverID(displays: [(id: 1, nativeMaximum: 100), (id: 2, nativeMaximum: 144)], isMoving: false, constrained: false) == 1,
+                     "when neither rate divides 60 FPS, minimize the longest interval")
+        precondition(FramePacer.driverID(displays: [(id: 1, nativeMaximum: 60), (id: 2, nativeMaximum: 75)], isMoving: true, constrained: false) == 2,
+                     "a smoother but slower driver must not reduce the available burst rate")
+        let changing = [(id: UInt32(1), nativeMaximum: 60), (id: UInt32(2), nativeMaximum: 75)]
+        precondition(FramePacer.driverID(displays: changing, isMoving: false, constrained: false) == 1,
+                     "idle chooses a regular 60 FPS clock")
+        precondition(FramePacer.driverID(displays: changing, isMoving: true, constrained: true) == 1,
+                     "entering the constrained mode restores the regular clock")
+        precondition(FramePacer.driverID(displays: changing, isMoving: true, constrained: false) == 2,
+                     "leaving the constrained mode restores the higher motion rate")
+        precondition(FramePacer.driverID(displays: [(id: 7, nativeMaximum: 120), (id: 2, nativeMaximum: 240)], isMoving: true, constrained: false) == 2,
+                     "equally regular clocks use the stable display ID")
         for native in [24, 30, 60, 75, 100, 120, 144, 240] {
             precondition(FramePacer.preferredRate(nativeMaximum: native, isMoving: false, constrained: false) == Double(min(native, 60)))
             precondition(FramePacer.preferredRate(nativeMaximum: native, isMoving: true, constrained: false) == Double(min(native, 120)))

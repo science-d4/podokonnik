@@ -1,5 +1,52 @@
 import AppKit
 
+private final class TestWindowMetadata {
+    private let lock = NSLock()
+    private var records: [[String: Any]]?
+
+    init(_ records: [[String: Any]]?) { self.records = records }
+    func set(_ records: [[String: Any]]?) { lock.lock(); self.records = records; lock.unlock() }
+    func read() -> [[String: Any]]? { lock.lock(); defer { lock.unlock() }; return records }
+}
+
+private final class StalledWindowMetadata {
+    private let lock = NSLock()
+    private let release = DispatchSemaphore(value: 0)
+    private var shouldBlock = false
+    private var active = 0
+    private var mostActive = 0
+    private var blocked = false
+    private var returnNil = false
+    private var reads = 0
+    private var delayedNil: TimeInterval?
+
+    func blockNext(returningNil: Bool = false) {
+        lock.lock(); shouldBlock = true; blocked = false; returnNil = returningNil; lock.unlock()
+    }
+    func delayNextNil(_ delay: TimeInterval) { lock.lock(); delayedNil = delay; lock.unlock() }
+    func unblock() { lock.lock(); shouldBlock = false; returnNil = false; lock.unlock(); release.signal() }
+    var isBlocked: Bool { lock.lock(); defer { lock.unlock() }; return blocked }
+    var maximumConcurrentReads: Int { lock.lock(); defer { lock.unlock() }; return mostActive }
+    var readCount: Int { lock.lock(); defer { lock.unlock() }; return reads }
+
+    func read() -> [[String: Any]]? {
+        lock.lock()
+        active += 1
+        reads += 1
+        mostActive = max(mostActive, active)
+        let wait = shouldBlock
+        let delay = delayedNil
+        delayedNil = nil
+        let returnsNil = returnNil || delay != nil
+        if wait { blocked = true }
+        lock.unlock()
+        if wait { _ = release.wait(timeout: .now() + 5) }
+        if let delay { Thread.sleep(forTimeInterval: delay) }
+        lock.lock(); active -= 1; lock.unlock()
+        return returnsNil ? nil : []
+    }
+}
+
 /// Compile separately with SnowTypes.swift and DesktopEnvironment.swift.
 /// Geometry tests are pure. Lifecycle checks read metadata but never request TCC,
 /// change other applications or require a WindowServer-backed screen to exist.
@@ -18,9 +65,13 @@ struct DesktopTests {
         hiddenWindowSupports()
         applicationMetadataCache()
         captureTiming()
+        captureWatchdogTiming()
         dockGeometryCache()
         notificationOcclusion()
         notificationGeometryCache()
+        failedWindowMetadata()
+        stalledWindowMetadata()
+        captureCompletesBeforeTimerHandler()
         lifecycle()
         print("DesktopTests: \(checks) checks passed")
     }
@@ -238,6 +289,28 @@ struct DesktopTests {
         events.handle(NSWorkspace.didActivateApplicationNotification, pid: 10, at: 100, load: reconcile)
         _ = events.snapshot(now: 100, load: loadAll)
         expect(allReads == 7, "a reversed clock invalidates the cache before event reconciliation")
+    }
+
+    private static func captureWatchdogTiming() {
+        var watchdog = DesktopCaptureWatchdog()
+        expect(watchdog.arm(at: 10), "the first capture arms the watchdog")
+        expect(!watchdog.arm(at: 10.4), "repeated refreshes do not postpone the first deadline")
+        watchdog.reset()
+        expect(watchdog.arm(at: 10.2), "a completed capture allows a new deadline")
+        let remaining = watchdog.consume(at: 10.5)
+        expect(remaining != nil && abs(remaining! - 0.2) < 1e-9,
+               "a queued event from the previous deadline must reschedule instead of timing out the new capture")
+        expect(watchdog.consume(at: 10.7) == 0, "the current deadline produces one timeout")
+        expect(watchdog.consume(at: 10.8) == nil && !watchdog.arm(at: 10.8),
+               "a timed-out capture cannot trigger or rearm until it completes")
+        watchdog.reset()
+        expect(watchdog.arm(at: 11), "stop or completion resets the watchdog for the next capture")
+        expect(!watchdog.expired(at: 11.49) && watchdog.expired(at: 11.51),
+               "completion after the deadline must detect timeout even before the timer handler runs")
+        watchdog.reset()
+        expect(!watchdog.expired(at: 12), "stop or completion clears the previous deadline")
+        expect(watchdog.arm(at: 12) && !watchdog.expired(at: 12.1),
+               "a restarted capture must not inherit the old generation's deadline")
     }
 
     private static func captureTiming() {
@@ -723,6 +796,193 @@ struct DesktopTests {
         expect(!DesktopGeometry.coversDisplay(left, screen), "fullscreen only affects its display")
         let converted = WorldCoordinates.fromQuartz(CGRect(x: -1440, y: -400, width: 500, height: 300), primaryHeight: 900)
         expect(converted == CGRect(x: -1440, y: 1000, width: 500, height: 300), "Quartz conversion uses primary top for a display above/left")
+    }
+
+    private static func failedWindowMetadata() {
+        let display = DesktopDisplay(id: 1, frame: CGRect(x: 0, y: 0, width: 1440, height: 900), visibleTop: 876)
+        let bounds = CGRect(x: 100, y: 700, width: 500, height: 200)
+        let record: [String: Any] = [
+            kCGWindowOwnerPID as String: NSNumber(value: ProcessInfo.processInfo.processIdentifier),
+            kCGWindowNumber as String: NSNumber(value: 987654),
+            kCGWindowBounds as String: bounds.dictionaryRepresentation,
+            kCGWindowLayer as String: NSNumber(value: 0),
+            kCGWindowAlpha as String: NSNumber(value: 1)
+        ]
+        let dockPID: pid_t = 987123
+        let dock: [String: Any] = [
+            kCGWindowOwnerPID as String: NSNumber(value: dockPID),
+            kCGWindowNumber as String: NSNumber(value: 987655),
+            kCGWindowBounds as String: CGRect(x: 200, y: 830, width: 1000, height: 60).dictionaryRepresentation,
+            kCGWindowLayer as String: NSNumber(value: CGWindowLevelForKey(.dockWindow)),
+            kCGWindowAlpha as String: NSNumber(value: 1)
+        ]
+        let metadata = TestWindowMetadata([record, dock])
+        let environment = DesktopEnvironment(windowMetadata: { metadata.read() }, displays: { [display] },
+                                             primaryDisplayTop: { display.frame.maxY },
+                                             applicationMetadata: { DesktopApplicationMetadata(dockPID: dockPID, supportPIDs: []) })
+        var snapshots: [DesktopSnapshot] = []
+        var failures = 0
+        environment.onSnapshot = { snapshots.append($0) }
+        environment.onCaptureUnavailable = { _ in failures += 1 }
+        environment.start()
+        wait(until: { !snapshots.isEmpty })
+        expect(!snapshots.isEmpty, "initial metadata produces a snapshot")
+        let initialFloor = snapshots[0].surfaces.first { $0.kind == .floor }
+        expect(initialFloor?.occluders.isEmpty == false, "initial snapshot contains the window mask")
+        let dockID = snapshots[0].surfaces.first { $0.kind == .dock }?.id
+        expect(dockID != nil, "initial snapshot contains a visible Dock")
+
+        metadata.set(nil)
+        environment.refresh()
+        wait(until: { failures > 0 })
+        expect(failures > 0, "nil window metadata reports an unavailable capture")
+        let countBeforeRetry = snapshots.count
+        RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+        expect(snapshots.count == countBeforeRetry, "a failed capture never publishes empty surfaces or masks")
+        expect(failures < 10, "repeated failures are retried at a bounded cadence")
+
+        metadata.set([record])
+        wait(until: { snapshots.count > countBeforeRetry })
+        expect(snapshots.count > countBeforeRetry, "polling recovers after metadata becomes available")
+        let recoveredFloor = snapshots.last?.surfaces.first { $0.kind == .floor }
+        expect(recoveredFloor?.occluders == initialFloor?.occluders,
+               "a later successful capture restores the same window mask")
+        let hiddenDock = snapshots.last?.surfaces.first { $0.kind == .dock }
+        expect(hiddenDock?.id == dockID && hiddenDock?.isVisible == false,
+               "the same Dock survives autohide after an unavailable capture")
+        metadata.set([record, dock])
+        environment.refresh()
+        wait(until: { snapshots.last?.surfaces.first(where: { $0.kind == .dock })?.isVisible == true })
+        expect(snapshots.last?.surfaces.first(where: { $0.kind == .dock })?.id == dockID,
+               "the same Dock becomes visible again after autohide")
+        environment.stop()
+    }
+
+    private static func stalledWindowMetadata() {
+        let display = DesktopDisplay(id: 1, frame: CGRect(x: 0, y: 0, width: 800, height: 600), visibleTop: 576)
+        let metadata = StalledWindowMetadata()
+        let environment = DesktopEnvironment(windowMetadata: { metadata.read() }, displays: { [display] },
+                                             primaryDisplayTop: { display.frame.maxY },
+                                             applicationMetadata: { DesktopApplicationMetadata(dockPID: nil, supportPIDs: []) })
+        var snapshots: [DesktopSnapshot] = []
+        var timeouts = 0
+        var failures = 0
+        var failureElapsed: TimeInterval = 0
+        environment.onSnapshot = { snapshots.append($0) }
+        environment.onCaptureTimeout = { timeouts += 1 }
+        environment.onCaptureUnavailable = { elapsed in failures += 1; failureElapsed = elapsed }
+        environment.start()
+        wait(until: { !snapshots.isEmpty })
+        RunLoop.main.run(until: Date().addingTimeInterval(0.6))
+        expect(timeouts == 0, "completed captures must not later fire their watchdogs")
+
+        metadata.delayNextNil(0.2)
+        environment.refresh()
+        wait(until: { failures == 1 || timeouts > 0 })
+        expect(failures == 1 && timeouts == 0 && failureElapsed >= 0.19,
+               "a delayed nil reports elapsed capture time without triggering an early watchdog")
+        failures = 0
+
+        metadata.blockNext()
+        environment.refresh()
+        wait(until: { metadata.isBlocked })
+        let before = snapshots.count
+        wait(until: { timeouts == 1 })
+        expect(timeouts == 1 && snapshots.count == before, "a blocked capture reports a timeout without publishing an empty snapshot")
+        environment.refresh()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.6))
+        expect(timeouts == 1 && metadata.maximumConcurrentReads == 1,
+               "repeated refreshes neither restart the watchdog nor run another capture")
+        let readsBeforeRelease = metadata.readCount
+        metadata.unblock()
+        wait(until: { snapshots.count > before })
+        expect(snapshots.count > before && metadata.readCount > readsBeforeRelease,
+               "a timed-out success is discarded and a fresh capture recovers")
+        expect(snapshots.dropFirst(before).allSatisfy { $0.captureMilliseconds < 500 },
+               "a stale successful result must not be published")
+
+        metadata.blockNext(returningNil: true)
+        environment.refresh()
+        wait(until: { metadata.isBlocked })
+        let beforeNil = snapshots.count
+        wait(until: { timeouts == 2 })
+        let readsBeforeNilRelease = metadata.readCount
+        metadata.unblock()
+        wait(until: { snapshots.count > beforeNil })
+        expect(timeouts == 2 && failures == 0 && metadata.readCount > readsBeforeNilRelease,
+               "a timed-out nil must not restart the failure grace period and a fresh capture recovers")
+
+        metadata.blockNext()
+        environment.refresh()
+        wait(until: { metadata.isBlocked })
+        environment.invalidate()
+        let beforeInvalidated = snapshots.count
+        wait(until: { timeouts == 3 })
+        expect(timeouts == 3, "an invalidated call that still blocks capture must time out")
+        metadata.unblock()
+        wait(until: { snapshots.count > beforeInvalidated })
+        expect(snapshots.count > beforeInvalidated && snapshots.last?.generation == 2,
+               "the invalidated result is discarded and a new capture recovers")
+
+        metadata.blockNext()
+        environment.refresh()
+        wait(until: { metadata.isBlocked })
+        environment.stop()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.6))
+        expect(timeouts == 3, "a stopped environment must not report a pending timeout")
+        environment.start()
+        wait(until: { timeouts == 4 })
+        expect(timeouts == 4 && metadata.maximumConcurrentReads == 1,
+               "a restarted environment reports the old blocking call without a concurrent capture")
+        let beforeRestart = snapshots.count
+        metadata.unblock()
+        wait(until: { snapshots.count > beforeRestart })
+        expect(snapshots.count > beforeRestart && snapshots.last?.generation == 4,
+               "restart discards the old result and delivers a fresh snapshot")
+        environment.stop()
+    }
+
+    private static func captureCompletesBeforeTimerHandler() {
+        let display = DesktopDisplay(id: 1, frame: CGRect(x: 0, y: 0, width: 800, height: 600), visibleTop: 576)
+        let metadata = StalledWindowMetadata()
+        var time: TimeInterval = 0
+        let environment = DesktopEnvironment(windowMetadata: { metadata.read() }, displays: { [display] },
+                                             primaryDisplayTop: { display.frame.maxY },
+                                             applicationMetadata: { DesktopApplicationMetadata(dockPID: nil, supportPIDs: []) },
+                                             watchdogTime: { time }, watchdogSchedule: { _ in .distantFuture })
+        var snapshots: [DesktopSnapshot] = []
+        var snapshotsAtTimeout: [Int] = []
+        var failures = 0
+        environment.onSnapshot = { snapshots.append($0) }
+        environment.onCaptureTimeout = { snapshotsAtTimeout.append(snapshots.count) }
+        environment.onCaptureUnavailable = { _ in failures += 1 }
+        environment.start()
+        wait(until: { !snapshots.isEmpty })
+        expect(!snapshots.isEmpty, "the watchdog completion fixture needs an initial snapshot")
+
+        // The timer is unscheduled and the monotonic clock advances explicitly,
+        // so only completion can report the expired deadline.
+        for mode in [0, 1, 2, 3] {
+            metadata.blockNext(returningNil: mode == 1)
+            environment.refresh()
+            wait(until: { metadata.isBlocked })
+            if mode == 2 { environment.invalidate() }
+            if mode == 3 { environment.stop(); environment.start() }
+            let before = snapshots.count
+            let previousTimeouts = snapshotsAtTimeout.count
+            let previousReads = metadata.readCount
+            time += 0.6
+            metadata.unblock()
+            wait(until: { snapshotsAtTimeout.count > previousTimeouts && snapshots.count > before })
+            expect(snapshotsAtTimeout.count == previousTimeouts + 1 && snapshotsAtTimeout.last == before,
+                   "completion past the deadline reports exactly one timeout before publishing any snapshot")
+            expect(snapshots.count > before && metadata.readCount > previousReads && failures == 0,
+                   "late success/nil and old generations are discarded before the fresh capture")
+        }
+        RunLoop.main.run(until: Date().addingTimeInterval(0.6))
+        expect(snapshotsAtTimeout.count == 4, "old queued timer events must not repeat timeouts after recovery")
+        expect(metadata.maximumConcurrentReads == 1, "deadline completion must not create concurrent captures")
+        environment.stop()
     }
 
     private static func lifecycle() {

@@ -5,6 +5,8 @@ import ApplicationServices
 /// Public entry points and snapshot delivery are confined to the main queue.
 final class DesktopEnvironment {
     var onSnapshot: ((DesktopSnapshot) -> Void)?
+    var onCaptureUnavailable: ((TimeInterval) -> Void)?
+    var onCaptureTimeout: (() -> Void)?
     /// Exclude only our full-screen effect windows. Other own windows (onboarding,
     /// popovers, menus) still occlude snow and never become accumulation surfaces.
     var excludedWindowIDs: Set<UInt32> = [] {
@@ -27,13 +29,42 @@ final class DesktopEnvironment {
     private var refreshPending = false
     private var generation: UInt64 = 0
     private var cancellation: DesktopCaptureCancellation?
+    private var watchdogTimer: DispatchSourceTimer?
+    private var watchdogSourceID: UUID?
+    private var captureWatchdog = DesktopCaptureWatchdog()
+    private var captureTimedOut = false
+    private var captureStartedAt: TimeInterval = 0
     private var lastDock: SnowSurface?
     private var lastDockPID: pid_t?
     private var previousFrames: [String: CGRect] = [:]
     private var trackedWindowSupports: [UInt32: pid_t] = [:]
     private var captureTiming = DesktopCaptureTiming()
+    private let windowMetadata: () -> [[String: Any]]?
+    private let displays: () -> [DesktopDisplay]
+    private let primaryDisplayTop: () -> CGFloat
+    private let applicationMetadata: () -> DesktopApplicationMetadata
+    private let watchdogTime: () -> TimeInterval
+    private let watchdogSchedule: (TimeInterval) -> DispatchTime
 
-    init() {}
+    init(windowMetadata: @escaping () -> [[String: Any]]? = {
+        CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]
+    }, displays: @escaping () -> [DesktopDisplay] = {
+        NSScreen.screens.compactMap { screen in
+            guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { return nil }
+            return DesktopDisplay(id: number.uint32Value, frame: screen.frame, visibleTop: screen.visibleFrame.maxY)
+        }
+    }, primaryDisplayTop: @escaping () -> CGFloat = { NSScreen.screens.first?.frame.maxY ?? 0 },
+       applicationMetadata: @escaping () -> DesktopApplicationMetadata = {
+        DesktopApplicationMetadata.read(NSWorkspace.shared.runningApplications)
+    }, watchdogTime: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+       watchdogSchedule: @escaping (TimeInterval) -> DispatchTime = { .now() + $0 }) {
+        self.windowMetadata = windowMetadata
+        self.displays = displays
+        self.primaryDisplayTop = primaryDisplayTop
+        self.applicationMetadata = applicationMetadata
+        self.watchdogTime = watchdogTime
+        self.watchdogSchedule = watchdogSchedule
+    }
 
     /// A button press starts polling, but rendering accelerates only after a
     /// retained surface has actually changed its geometry.
@@ -56,6 +87,13 @@ final class DesktopEnvironment {
         self.timer = timer
         timer.schedule(deadline: .distantFuture)
         timer.resume()
+        let watchdog = DispatchSource.makeTimerSource(queue: .main)
+        let watchdogID = UUID()
+        watchdogSourceID = watchdogID
+        watchdog.setEventHandler { [weak self] in self?.captureWatchdogFired(sourceID: watchdogID) }
+        watchdogTimer = watchdog
+        watchdog.schedule(deadline: .distantFuture)
+        watchdog.resume()
         refresh()
     }
 
@@ -65,6 +103,10 @@ final class DesktopEnvironment {
         running = false
         generation &+= 1
         cancellation?.cancel()
+        captureWatchdog.reset()
+        watchdogSourceID = nil
+        watchdogTimer?.cancel()
+        watchdogTimer = nil
         timer?.cancel()
         timer = nil
         refreshPending = false
@@ -101,24 +143,21 @@ final class DesktopEnvironment {
         guard running else { return }
         guard !inFlight else {
             refreshPending = true
+            // A previous-generation call can still be executing after a restart.
+            // It blocks the next capture, so the wait also needs a watchdog.
+            if !displays().isEmpty { startCaptureWatchdog() }
             return
         }
         timer?.schedule(deadline: .distantFuture)
         captureTiming.captureStarted(at: ProcessInfo.processInfo.systemUptime)
 
-        let screens = NSScreen.screens
-        let displays = screens.compactMap { screen -> DesktopDisplay? in
-            guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { return nil }
-            return DesktopDisplay(id: number.uint32Value, frame: screen.frame, visibleTop: screen.visibleFrame.maxY)
-        }
+        let displays = self.displays()
         // NSScreen.screens[0] is the primary/menu-bar display, not NSScreen.main
         // (which changes with the key window). Quartz's Y origin is its top edge.
-        let primaryTop = screens.first?.frame.maxY ?? 0
+        let primaryTop = primaryDisplayTop()
         // activationPolicy/isHidden fetch dynamic process properties. Cache those
         // separately from fast window geometry, expiring them within one second.
-        let applications = applicationCache.snapshot(now: ProcessInfo.processInfo.systemUptime) {
-            DesktopApplicationMetadata.read(NSWorkspace.shared.runningApplications)
-        }
+        let applications = applicationCache.snapshot(now: ProcessInfo.processInfo.systemUptime, load: applicationMetadata)
         let token = DesktopCaptureCancellation()
         let context = DesktopCaptureContext(
             generation: generation, displays: displays, primaryTop: primaryTop,
@@ -130,11 +169,16 @@ final class DesktopEnvironment {
         inFlight = true
         refreshPending = false
         cancellation = token
+        captureStartedAt = ProcessInfo.processInfo.systemUptime
+        captureTimedOut = false
+        if !displays.isEmpty { startCaptureWatchdog() }
         let notificationCache = notificationGeometryCache
         let dockCache = dockGeometryCache, dockQueue = dockQueue, captureQueue = queue
+        let windowMetadata = windowMetadata
         queue.async { [weak self] in
             let result = DesktopCapture.capture(context, cancellation: token, notificationCache: notificationCache,
-                                                dockCache: dockCache, dockQueue: dockQueue, captureQueue: captureQueue) { [weak self] in
+                                                dockCache: dockCache, dockQueue: dockQueue, captureQueue: captureQueue,
+                                                windowMetadata: windowMetadata) { [weak self] in
                 DispatchQueue.main.async { [weak self] in
                     guard let self, self.running, self.generation == context.generation else { return }
                     self.refresh()
@@ -180,11 +224,34 @@ final class DesktopEnvironment {
 
     private func complete(_ result: DesktopCaptureResult?, context: DesktopCaptureContext,
                           cancellation token: DesktopCaptureCancellation) {
+        // Completion can reach the main queue ahead of an already-due timer.
+        let deadlineExpired = captureWatchdog.expired(at: watchdogTime())
         inFlight = false
         cancellation = nil
+        captureWatchdog.reset()
+        watchdogTimer?.schedule(deadline: .distantFuture)
+        let timedOut = captureTimedOut
+        captureTimedOut = false
         guard running else { return }
+        // A cancelled call can still block the current generation. If its wait
+        // has expired, hide stale geometry before starting the replacement.
+        if timedOut || deadlineExpired {
+            if !timedOut { onCaptureTimeout?() }
+            refresh()
+            return
+        }
         guard !token.isCancelled, context.generation == generation, let result else {
             refresh()
+            return
+        }
+        if !result.hasWindowMetadata && !context.displays.isEmpty {
+            // No geometry is better than an incomplete snapshot: the latter
+            // deletes the Dock and loses all window occlusion masks.
+            let now = ProcessInfo.processInfo.systemUptime
+            let delay = max(0.05, captureTiming.delayAfterCapture(at: now))
+            timer?.schedule(deadline: .now() + delay, leeway: .milliseconds(8))
+            refreshPending = false
+            onCaptureUnavailable?(max(0, now - captureStartedAt))
             return
         }
         var snapshot = result.snapshot
@@ -228,10 +295,58 @@ final class DesktopEnvironment {
         if needsAnother && running { refresh() }
     }
 
+    private func startCaptureWatchdog() {
+        guard captureWatchdog.arm(at: watchdogTime()) else { return }
+        watchdogTimer?.schedule(deadline: watchdogSchedule(0.5))
+    }
+
+    private func captureWatchdogFired(sourceID: UUID) {
+        guard watchdogSourceID == sourceID, running, inFlight,
+              let remaining = captureWatchdog.consume(at: watchdogTime()) else { return }
+        // An old event can already be queued when a new capture is armed.
+        if remaining > 0 {
+            watchdogTimer?.schedule(deadline: watchdogSchedule(remaining))
+            return
+        }
+        watchdogTimer?.schedule(deadline: .distantFuture)
+        captureTimedOut = true
+        onCaptureTimeout?()
+    }
+
     deinit {
         cancellation?.cancel()
         timer?.cancel()
+        watchdogTimer?.cancel()
         workspaceObservers.forEach { workspaceCenter.removeObserver($0) }
+    }
+}
+
+/// Deadline state is independent of dispatch-source events, which can arrive
+/// late after a previous capture was cancelled and a new one was armed.
+struct DesktopCaptureWatchdog {
+    private var deadline: TimeInterval?
+    private var fired = false
+
+    mutating func reset() { deadline = nil; fired = false }
+
+    mutating func arm(at time: TimeInterval) -> Bool {
+        guard deadline == nil && !fired else { return false }
+        deadline = time + 0.5
+        return true
+    }
+
+    func expired(at time: TimeInterval) -> Bool {
+        deadline.map { time >= $0 } ?? fired
+    }
+
+    /// Returns remaining seconds, zero for the one timeout, or nil if disarmed.
+    mutating func consume(at time: TimeInterval) -> TimeInterval? {
+        guard let deadline else { return nil }
+        let remaining = deadline - time
+        guard remaining <= 0 else { return remaining }
+        self.deadline = nil
+        fired = true
+        return 0
     }
 }
 
@@ -467,7 +582,7 @@ final class DesktopNotificationGeometryCache {
     }
 }
 
-private struct DesktopDisplay {
+struct DesktopDisplay {
     let id: UInt32
     let frame: CGRect
     let visibleTop: CGFloat
@@ -520,6 +635,7 @@ private enum DesktopCapture {
                         cancellation: DesktopCaptureCancellation,
                         notificationCache: DesktopNotificationGeometryCache,
                         dockCache: DesktopDockGeometryCache, dockQueue: DispatchQueue, captureQueue: DispatchQueue,
+                        windowMetadata: () -> [[String: Any]]?,
                         onDockChange: @escaping () -> Void) -> DesktopCaptureResult? {
         guard !cancellation.isCancelled else { return nil }
         let start = ProcessInfo.processInfo.systemUptime
@@ -532,9 +648,15 @@ private enum DesktopCapture {
         }
         // Extract only geometric metadata. We never access kCGWindowName,
         // kCGWindowOwnerName, sharing state or image APIs.
-        let metadata = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+        let metadata = windowMetadata()
         guard !cancellation.isCancelled else { return nil }
-        let records = (metadata as? [[String: Any]] ?? []).compactMap { dictionary -> DesktopWindowRecord? in
+        guard let metadata else {
+            return DesktopCaptureResult(snapshot: DesktopSnapshot(generation: context.generation, surfaces: [], fullscreenDisplayIDs: [],
+                                       accessibilityTrusted: trusted, dockDetected: false, windowCount: 0,
+                                       captureMilliseconds: (ProcessInfo.processInfo.systemUptime - start) * 1000),
+                                        hasWindowMetadata: false)
+        }
+        let records = metadata.compactMap { dictionary -> DesktopWindowRecord? in
             guard let pid = (dictionary[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
                   let id = (dictionary[kCGWindowNumber as String] as? NSNumber)?.uint32Value,
                   !context.excludedWindowIDs.contains(id),
@@ -696,7 +818,7 @@ private enum DesktopCapture {
                                captureMilliseconds: (ProcessInfo.processInfo.systemUptime - start) * 1000,
                                hiddenWindowSupportIDs: hiddenSupportIDs,
                                screenshotSelectionActive: !screenshotOwners.isEmpty),
-                                    hasWindowMetadata: metadata != nil, windowSupports: windowSupports)
+                                    hasWindowMetadata: true, windowSupports: windowSupports)
     }
 
     private static func area(_ rect: CGRect) -> CGFloat { rect.width * rect.height }

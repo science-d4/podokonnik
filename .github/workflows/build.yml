@@ -18,6 +18,8 @@ jobs:
           persist-credentials: false
       - name: Run tests
         run: bash Scripts/test.sh
+      - name: Test release ordering
+        run: python3 Tests/ReleaseVersionTests.py
       - name: Build application
         run: bash Scripts/build.sh
 
@@ -37,44 +39,22 @@ jobs:
           persist-credentials: false
       - name: Select release version
         id: version
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          python3 - <<'PY'
-          import os
-          import re
-          import subprocess
-
-          pattern = re.compile(r'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)')
-          baseline = subprocess.check_output(['/usr/libexec/PlistBuddy', '-c', 'Print :CFBundleShortVersionString', 'Resources/Info.plist'], text=True).strip()
-          if not pattern.fullmatch('v' + baseline):
-              raise SystemExit(f'Invalid baseline version: {baseline}')
-          tags = subprocess.check_output(['git', 'tag', '--list'], text=True).splitlines()
-          current_tags = set(subprocess.check_output(['git', 'tag', '--points-at', os.environ['GITHUB_SHA']], text=True).splitlines())
-          matching = sorted(tag for tag in current_tags if pattern.fullmatch(tag))
-          if len(matching) > 1:
-              raise SystemExit('Multiple version tags point to this commit; resolve manually.')
-          if matching:
-              tag = matching[0]
-          else:
-              versions = [tuple(map(int, baseline.split('.')))]
-              versions.extend(tuple(map(int, match.groups())) for tag in tags if (match := pattern.fullmatch(tag)))
-              major, minor, patch = max(versions)
-              tag = f'v{major}.{minor}.{patch + 1}'
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-              output.write(f'tag={tag}\nversion={tag[1:]}\nexisting={str(bool(matching)).lower()}\n')
-          PY
+        run: python3 Scripts/select-release-version.py
       - name: Build release application
+        if: steps.version.outputs.publish == 'true'
         env:
           PODOKONNIK_VERSION: ${{ steps.version.outputs.version }}
         run: bash Scripts/build.sh
       - name: Package release
+        if: steps.version.outputs.publish == 'true'
         run: bash Scripts/package-dmg.sh
       - name: Sign update feed
+        if: steps.version.outputs.publish == 'true'
         env:
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
         run: bash Scripts/create-appcast.sh
       - name: Publish release
+        if: steps.version.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.version.outputs.tag }}

@@ -5,6 +5,24 @@ private struct LifecycleFailure: Error, CustomStringConvertible {
     let description: String
 }
 
+private final class LifecycleWindowMetadata {
+    private let lock = NSLock()
+    private var failing = false
+    private var delayNext: TimeInterval = 0
+    private var delayedStart: TimeInterval?
+    func setFailing(_ value: Bool) { lock.lock(); failing = value; lock.unlock() }
+    func delayNextRead(_ delay: TimeInterval) { lock.lock(); delayNext = delay; delayedStart = nil; lock.unlock() }
+    func delayedReadStartedAt() -> TimeInterval? { lock.lock(); defer { lock.unlock() }; return delayedStart }
+    func read() -> [[String: Any]]? {
+        lock.lock(); let shouldFail = failing; let delay = delayNext; delayNext = 0
+        if delay > 0 { delayedStart = ProcessInfo.processInfo.systemUptime }
+        lock.unlock()
+        if delay > 0 { Thread.sleep(forTimeInterval: delay) }
+        if shouldFail { return nil }
+        return CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]
+    }
+}
+
 @MainActor
 private final class LifecycleChecks {
     private(set) var count = 0
@@ -115,7 +133,8 @@ private final class LifecycleChecks {
             throw LifecycleFailure(description: "A GUI session is required; run outside the sandbox after stopping the product's benchmark.")
         }
         try verifyUnlaunchedCleanup(settingsURL: settingsURL)
-        let controller = ApplicationController()
+        let metadata = LifecycleWindowMetadata()
+        let controller = ApplicationController(desktop: DesktopEnvironment(windowMetadata: { metadata.read() }))
         var newer = SettingsStore(url: settingsURL).load()
         newer.windX = 0.125
         SettingsStore(url: settingsURL).save(newer)
@@ -169,6 +188,61 @@ private final class LifecycleChecks {
         try verify(controller.world.surfaces.map(\.id) == [support.id], "snapshot callback must update the world")
         try verify(controller.overlays.values.allSatisfy { $0.window.isVisible }, "accepted geometry must allow own overlays to be ordered onscreen")
         log("PASS fresh-snapshot gate: hidden before delivery, world updated and own windows shown after injected delivery")
+
+        // Prevent the real reader from replacing the synthetic support while
+        // testing the failure timer and its cancellation.
+        metadata.setFailing(true)
+        controller.desktop.invalidate()
+        guard let gameOverlay = controller.overlays.values.first else {
+            throw LifecycleFailure(description: "failure test needs an overlay")
+        }
+        controller.playingDisplay = gameOverlay.id
+        gameOverlay.window.receivesGameInput = true
+        gameOverlay.window.ignoresMouseEvents = false
+        gameOverlay.scene.playing = true
+        controller.desktop.onCaptureUnavailable?(0)
+        try verify(controller.awaitingFreshSnapshot && controller.overlays.values.allSatisfy { $0.window.isVisible && $0.isPaused },
+                   "a short capture failure must freeze the last frame without hiding it")
+        try verify(controller.playingDisplay == nil && gameOverlay.window.ignoresMouseEvents
+                   && controller.gameControl?.isEnabled == false,
+                   "a failed capture must end game input and prevent starting it during the grace period")
+        metadata.setFailing(false)
+        controller.desktop.onSnapshot?(ownSnapshot)
+        try await Task.sleep(nanoseconds: 650_000_000)
+        try verify(controller.overlays.values.allSatisfy { $0.window.isVisible },
+                   "a successful capture must cancel the previous hide timer")
+        controller.desktop.onSnapshot?(ownSnapshot)
+        try verify(controller.world.placeSnowman(on: support, x: support.frame.midX), "failure test needs an attached snowman")
+        let ballIDs = controller.world.balls.map(\.id)
+        metadata.setFailing(true)
+        controller.desktop.invalidate()
+        controller.desktop.onCaptureUnavailable?(0)
+        try await Task.sleep(nanoseconds: 300_000_000)
+        controller.desktop.onCaptureUnavailable?(0)
+        try await Task.sleep(nanoseconds: 300_000_000)
+        try verify(controller.awaitingFreshSnapshot,
+                   "a failed geometry capture must keep waiting for recovery")
+        try verify(controller.overlays.values.allSatisfy { !$0.window.isVisible && $0.isPaused },
+                   "repeated failures must not extend the grace period")
+        try verify(controller.infoLabel?.stringValue == "Не удалось получить положение окон · повторяем попытку",
+                   "the menu must explain why the effects are hidden and that capture will retry")
+        try verify(controller.world.balls.map(\.id) == ballIDs, "a failed capture must preserve attached objects")
+        metadata.setFailing(false)
+        controller.desktop.onSnapshot?(ownSnapshot)
+        try verify(!controller.awaitingFreshSnapshot && controller.overlays.values.allSatisfy { $0.window.isVisible },
+                   "a successful capture must restore the overlays")
+        try verify(controller.infoLabel?.stringValue != "Не удалось получить положение окон · повторяем попытку",
+                   "the capture error must disappear after recovery")
+        try verify(controller.world.balls.map(\.id) == ballIDs, "recovery must preserve attached objects")
+        metadata.setFailing(true)
+        controller.desktop.invalidate()
+        controller.desktop.onCaptureUnavailable?(0.45)
+        await drain(for: 0.15)
+        try verify(controller.overlays.values.allSatisfy { !$0.window.isVisible && $0.isPaused },
+                   "a slow failed read must use only its remaining grace time")
+        metadata.setFailing(false)
+        controller.desktop.onSnapshot?(ownSnapshot)
+        controller.world.clearAll()
 
         for _ in 0..<40 { controller.world.step(delta: 0.1, weather: controller.weather, activeRegions: [screen.frame]) }
         // Flush the profile's bounded accumulation batch before comparing state.
@@ -405,7 +479,10 @@ private final class LifecycleChecks {
                    "pause/resume and session transitions must not duplicate overlays or observers")
         log("PASS real metadata callback: DesktopEnvironment supplies fresh geometry after resume")
         if !CommandLine.arguments.contains("--spritekit-particles") { try await verifyMetalFrameLifecycle(controller) }
+        try verifyDriverClock(controller)
         try await verifyGameHost(controller)
+        try await verifyFailureFocus(controller)
+        try await verifySlowCapture(controller, metadata: metadata)
         try await verifyPermissionFromGame(controller)
         if !CommandLine.arguments.contains("--spritekit-particles") { try await verifyRenderingFailure(controller) }
         controller.settings.paused = true
@@ -587,6 +664,21 @@ private final class LifecycleChecks {
         log("PASS Metal frames: submitted=\(before) stayed fixed during pause; fresh resume advanced to \(after). This is frame progression, not an FPS benchmark.")
     }
 
+    private func verifyDriverClock(_ controller: ApplicationController) throws {
+        guard let id = controller.driverID, let frame = controller.overlays[id]?.scene.onFrame else {
+            throw LifecycleFailure(description: "driver clock test needs a running display")
+        }
+        let timestamp = ProcessInfo.processInfo.systemUptime + 1
+        frame(timestamp)
+        frame(timestamp - 0.01)
+        try verify(controller.lastFrame == timestamp,
+                   "an earlier target timestamp must not rewind the shared clock when the driver changes")
+        frame(timestamp + 0.01)
+        try verify(controller.lastFrame == timestamp + 0.01, "the shared clock must resume from the latest timestamp")
+        controller.lastFrame = 0
+        log("PASS driver clock: out-of-order display timestamps do not rewind shared time")
+    }
+
     private func verifyGameHost(_ controller: ApplicationController) async throws {
         let pointer = NSEvent.mouseLocation
         guard let overlay = controller.overlays.values.first(where: { $0.window.frame.contains(pointer) && !$0.isPaused }) else {
@@ -635,6 +727,100 @@ private final class LifecycleChecks {
         }
         controller.endGame() // Idempotent cleanup after Escape.
         log("PASS game host: actual control action, HUD child above the unified scene, own-window Escape and passive input; previous focus checked when an external foreground app was available")
+    }
+
+    private func verifyFailureFocus(_ controller: ApplicationController) async throws {
+        let original = NSWorkspace.shared.frontmostApplication
+        var restoredPIDs: [pid_t] = []
+        controller.activatePreviousApp = { application in
+            restoredPIDs.append(application.processIdentifier)
+            application.activate(options: [])
+        }
+        let executable = URL(fileURLWithPath: CommandLine.arguments[0],
+                             relativeTo: URL(fileURLWithPath: FileManager.default.currentDirectoryPath)).standardizedFileURL
+        let first = Process()
+        let second = Process()
+        first.executableURL = executable; first.arguments = ["--duck-fixture-window"]
+        second.executableURL = executable; second.arguments = ["--duck-fixture-window"]
+        defer {
+            controller.activatePreviousApp = { $0.activate(options: []) }
+            let frontmost = NSWorkspace.shared.frontmostApplication?.processIdentifier
+            if frontmost == first.processIdentifier || frontmost == second.processIdentifier || frontmost == getpid() {
+                if let original, original.processIdentifier != getpid(), !original.isTerminated { original.activate(options: []) }
+            }
+            if first.isRunning { first.terminate() }
+            if second.isRunning { second.terminate() }
+        }
+        try first.run()
+        await wait(until: { NSWorkspace.shared.frontmostApplication?.processIdentifier == first.processIdentifier }, timeout: 3)
+        try verify(NSWorkspace.shared.frontmostApplication?.processIdentifier == first.processIdentifier,
+                   "own focus fixture must be the foreground application")
+        guard let snapshot = controller.snapshot else { throw LifecycleFailure(description: "focus test needs a snapshot") }
+        try sendAction(controller.gameControl)
+        await wait(until: { NSApp.isActive && controller.playingDisplay != nil }, timeout: 2)
+        try verify(NSApp.isActive && controller.playingDisplay != nil
+                   && controller.previousApp?.processIdentifier == first.processIdentifier,
+                   "starting the game must remember the own foreground fixture")
+        controller.desktop.onCaptureUnavailable?(0)
+        await wait(until: { NSWorkspace.shared.frontmostApplication?.processIdentifier == first.processIdentifier }, timeout: 2)
+        try verify(controller.playingDisplay == nil
+                   && NSWorkspace.shared.frontmostApplication?.processIdentifier == first.processIdentifier,
+                   "capture failure must return focus to the previous own application")
+        try verify(restoredPIDs == [first.processIdentifier],
+                   "capture failure must explicitly request activation of the previously active application")
+        controller.desktop.onSnapshot?(snapshot)
+        try sendAction(controller.gameControl)
+        await wait(until: { NSApp.isActive && controller.playingDisplay != nil }, timeout: 2)
+        try verify(NSApp.isActive && controller.playingDisplay != nil
+                   && controller.previousApp?.processIdentifier == first.processIdentifier,
+                   "the second game must also remember the original own fixture")
+        try second.run()
+        await wait(until: { NSWorkspace.shared.frontmostApplication?.processIdentifier == second.processIdentifier }, timeout: 3)
+        try verify(NSWorkspace.shared.frontmostApplication?.processIdentifier == second.processIdentifier,
+                   "second own fixture must become foreground")
+        controller.desktop.onCaptureUnavailable?(0)
+        await drain(for: 0.1)
+        try verify(NSWorkspace.shared.frontmostApplication?.processIdentifier == second.processIdentifier,
+                   "failure after switching applications must not take focus from the user's choice")
+        try verify(restoredPIDs == [first.processIdentifier],
+                   "switching applications before the failure must not request restoration")
+        controller.desktop.onSnapshot?(snapshot)
+        log("PASS capture failure focus: previous own application restored; later selected own application remains active")
+    }
+
+    private func verifySlowCapture(_ controller: ApplicationController, metadata: LifecycleWindowMetadata) async throws {
+        await wait(until: { !controller.awaitingFreshSnapshot && controller.overlays.values.contains { !$0.isPaused } }, timeout: 3)
+        try verify(!controller.awaitingFreshSnapshot, "slow capture test needs a live scene")
+        controller.desktop.stop()
+        await drain(for: 0.2)
+        metadata.setFailing(true)
+        metadata.delayNextRead(0.4)
+        controller.desktop.start()
+        await wait(until: { metadata.delayedReadStartedAt() != nil }, timeout: 2)
+        guard let started = metadata.delayedReadStartedAt() else {
+            throw LifecycleFailure(description: "delayed failed metadata read did not start")
+        }
+        await wait(until: { controller.overlays.values.allSatisfy { !$0.window.isVisible && $0.isPaused } }, timeout: 1)
+        let delay = ProcessInfo.processInfo.systemUptime - started
+        try verify(controller.awaitingFreshSnapshot && controller.overlays.values.allSatisfy { !$0.window.isVisible && $0.isPaused },
+                   "a delayed nil result must hide effects after the total grace period")
+        try verify(delay >= 0.4 && delay < 0.8,
+                   "a 400 ms read failure must not start a second 500 ms grace period")
+        metadata.setFailing(false)
+        await wait(until: { !controller.awaitingFreshSnapshot && controller.overlays.values.contains { $0.window.isVisible } }, timeout: 3)
+        try verify(!controller.awaitingFreshSnapshot && controller.overlays.values.contains { $0.window.isVisible },
+                   "a valid read must restore the scene after the delayed failure")
+        controller.desktop.stop()
+        await drain(for: 0.2)
+        metadata.delayNextRead(1.3)
+        controller.desktop.start()
+        await wait(until: { controller.overlays.values.allSatisfy { !$0.window.isVisible && $0.isPaused } }, timeout: 1.1)
+        try verify(controller.awaitingFreshSnapshot && controller.overlays.values.allSatisfy { !$0.window.isVisible && $0.isPaused },
+                   "an unfinished metadata read must hide effects after its timeout")
+        await wait(until: { !controller.awaitingFreshSnapshot && controller.overlays.values.contains { $0.window.isVisible } }, timeout: 4)
+        try verify(!controller.awaitingFreshSnapshot && controller.overlays.values.contains { $0.window.isVisible },
+                   "a fresh capture after a timed-out read must restore the scene")
+        log("PASS delayed metadata: timed-out in-flight capture hides effects and a fresh read restores them")
     }
 
     private func verifyDecorationControls(_ controller: ApplicationController) async throws {

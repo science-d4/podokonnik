@@ -109,7 +109,7 @@ final class ApplicationController: NSObject, NSApplicationDelegate, NSPopoverDel
     private var windowDragReleasedAt: TimeInterval?
     var primaryPointerDown: () -> Bool = { NSEvent.pressedMouseButtons & 1 != 0 }
     private var spaceGeometryUntil: TimeInterval = 0
-    let desktop = DesktopEnvironment()
+    let desktop: DesktopEnvironment
     let store: SettingsStore
     var settings: AppSettings
     private var updateController: UpdateController?
@@ -128,12 +128,15 @@ final class ApplicationController: NSObject, NSApplicationDelegate, NSPopoverDel
     var playingDisplay: UInt32?
     var previousApp: NSRunningApplication?
     var appBeforePopover: NSRunningApplication?
+    var activatePreviousApp: (NSRunningApplication) -> Void = { $0.activate(options: []) }
     var currentTool: SnowTool = .mitten
     var snapshot: DesktopSnapshot?
     var lastFrame: TimeInterval = 0
     var frameIntervals: [Double] = []
     var lastRefresh: TimeInterval = 0
     var awaitingFreshSnapshot = true
+    private var geometryUnavailable = false
+    private var captureFailureToken: UUID?
     var desktopActive = false
     var intensityControl: ActionSegment?
     var pauseControl: ActionButton?
@@ -164,7 +167,10 @@ final class ApplicationController: NSObject, NSApplicationDelegate, NSPopoverDel
     let evidenceDirectory: URL?
     let buildInfo: [String: String]
 
-    override init() {
+    override convenience init() { self.init(desktop: DesktopEnvironment()) }
+
+    init(desktop: DesktopEnvironment) {
+        self.desktop = desktop
         let args = CommandLine.arguments
         func value(_ key: String) -> String? {
             guard let i = args.firstIndex(of: key), i+1 < args.count else { return nil }; return args[i+1]
@@ -210,6 +216,8 @@ final class ApplicationController: NSObject, NSApplicationDelegate, NSPopoverDel
         }
         setupMenu(); observeSystem(); rebuildDisplays()
         desktop.onSnapshot = { [weak self] snapshot in self?.receive(snapshot) }
+        desktop.onCaptureUnavailable = { [weak self] elapsed in self?.captureUnavailable(elapsed: elapsed) }
+        desktop.onCaptureTimeout = { [weak self] in self?.captureUnavailable(graceExpired: true) }
         refreshPolicy()
         if smokeSeconds != nil { beginSmokeTest() }
         else if !settings.onboardingComplete { showWelcome() }
@@ -219,6 +227,7 @@ final class ApplicationController: NSObject, NSApplicationDelegate, NSPopoverDel
         // A rejected second launch must not save its stale settings or clean up
         // resources belonging to the running instance.
         guard ownsSession else { return }
+        captureFailureToken = nil
         defer { ownsSession = false; instanceLock?.release(); instanceLock = nil }
         desktop.stop(); smokeTimer?.invalidate(); metricTimer?.invalidate(); saveWork?.cancel()
         if let gameKeyMonitor { NSEvent.removeMonitor(gameKeyMonitor) }
@@ -286,7 +295,9 @@ final class ApplicationController: NSObject, NSApplicationDelegate, NSPopoverDel
     }
 
     var driverID: UInt32? {
-        overlays.keys.filter { overlays[$0]?.isPaused == false }.sorted().first
+        FramePacer.driverID(displays: overlays.values.filter { !$0.isPaused }.map {
+            (id: $0.id, nativeMaximum: $0.maximumFPS)
+        }, isMoving: desktop.isGeometryMoving, constrained: weather.lowPower || weather.reducedMotion)
     }
 
     private var activeDuckDisplays: [DuckDisplay] {
@@ -313,7 +324,9 @@ final class ApplicationController: NSObject, NSApplicationDelegate, NSPopoverDel
             }
         }
         let delta = lastFrame == 0 ? 1.0/60 : max(0, time-lastFrame)
-        lastFrame = time
+        // Different display links may report their target timestamps out of order
+        // when the driver changes. Never count an interval twice.
+        lastFrame = max(lastFrame, time)
         if smokeSeconds != nil && delta > 0 && frameIntervals.count < 1_000_000 { frameIntervals.append(delta) }
         let regions = overlays.values.filter { !$0.isPaused }.map { $0.window.frame }
         world.step(delta: min(delta, 0.1), weather: weather, activeRegions: regions)
@@ -353,6 +366,7 @@ final class ApplicationController: NSObject, NSApplicationDelegate, NSPopoverDel
     }
 
     private func receive(_ new: DesktopSnapshot) {
+        captureFailureToken = nil
         let trustLost = snapshot?.accessibilityTrusted == true && !new.accessibilityTrusted
         snapshot = new
         if trustLost { endGame(restoreFocus: false) }
@@ -382,8 +396,32 @@ final class ApplicationController: NSObject, NSApplicationDelegate, NSPopoverDel
         duckWorld.sync(world.surfaces, fullscreenFrames: fullscreenFrames)
         for (id, velocity) in shakes { world.shedSnow(surfaceID: id, velocity: velocity) }
         if !shakes.isEmpty { duckWorld.windowShook(Set(shakes.keys)) }
+        geometryUnavailable = false
         awaitingFreshSnapshot = false
         refreshPolicy()
+    }
+
+    private func captureUnavailable(elapsed: TimeInterval = 0, graceExpired: Bool = false) {
+        guard !geometryUnavailable else { return }
+        if graceExpired || elapsed >= 0.5 {
+            captureFailureToken = nil
+            geometryUnavailable = true
+        } else {
+            guard captureFailureToken == nil else { return }
+            captureFailureToken = UUID()
+        }
+        awaitingFreshSnapshot = true
+        endGame()
+        resetWindowMotion()
+        lastFrame = 0
+        refreshPolicy()
+        guard let token = captureFailureToken else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + max(0, 0.5 - elapsed)) { [weak self] in
+            guard let self, self.captureFailureToken == token else { return }
+            self.captureFailureToken = nil
+            self.geometryUnavailable = true
+            self.refreshPolicy()
+        }
     }
 
     private func resetWindowMotion() {
@@ -409,7 +447,7 @@ final class ApplicationController: NSObject, NSApplicationDelegate, NSPopoverDel
         updateRenderRates()
         let screens = NSScreen.screens
         for overlay in overlays.values {
-            let allowed = policy.isVisible(displayID: overlay.id) && overlay.renderingFailure == nil
+            let allowed = policy.isVisible(displayID: overlay.id) && overlay.renderingFailure == nil && !geometryUnavailable
             let geometryReady = !awaitingFreshSnapshot
             overlay.scene.weather = weather
             overlay.scene.decorationOptions = settings.decorations
@@ -700,6 +738,7 @@ final class ApplicationController: NSObject, NSApplicationDelegate, NSPopoverDel
         else if let error = store.lastError { infoLabel?.stringValue = error }
         else if policy.globallySuspended { infoLabel?.stringValue = "Пауза · снег сохранён" }
         else if policy.screenshotPaused { infoLabel?.stringValue = "Пауза на время снимка экрана" }
+        else if geometryUnavailable { infoLabel?.stringValue = "Не удалось получить положение окон · повторяем попытку" }
         else if playingDisplay != nil { infoLabel?.stringValue = "Игра включена · Esc возвращает рабочий стол" }
         else { infoLabel?.stringValue = "Снег идёт · клики проходят в приложения" }
     }
@@ -725,6 +764,8 @@ final class ApplicationController: NSObject, NSApplicationDelegate, NSPopoverDel
 
     func endGame(restoreFocus: Bool = true) {
         guard let id = playingDisplay else { return }
+        let shouldRestoreFocus = restoreFocus && NSApp.isActive
+            && NSWorkspace.shared.frontmostApplication?.processIdentifier == getpid()
         playingDisplay = nil
         if let gameKeyMonitor { NSEvent.removeMonitor(gameKeyMonitor); self.gameKeyMonitor = nil }
         if let overlay = overlays[id] {
@@ -733,7 +774,7 @@ final class ApplicationController: NSObject, NSApplicationDelegate, NSPopoverDel
             overlay.hud?.removeFromSuperview(); overlay.hud = nil
             overlay.window.resignKey()
         }
-        if restoreFocus && NSApp.isActive { previousApp?.activate(options: []) }
+        if shouldRestoreFocus, let previousApp { activatePreviousApp(previousApp) }
         previousApp = nil; updateLabels()
     }
 

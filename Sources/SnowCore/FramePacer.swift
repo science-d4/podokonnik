@@ -3,6 +3,24 @@ import Foundation
 /// Distributes a requested rate over display ticks without assuming that it
 /// divides the monitor refresh rate (for example 60 FPS on a 100 Hz display).
 struct FramePacer {
+    /// Prefer the fastest allowed update rate and then its most regular cadence.
+    static func driverID(displays: [(id: UInt32, nativeMaximum: Int)],
+                         isMoving: Bool, constrained: Bool) -> UInt32? {
+        displays.sorted {
+            let leftNative = max(1, $0.nativeMaximum)
+            let rightNative = max(1, $1.nativeMaximum)
+            let leftRate = Int(preferredRate(nativeMaximum: leftNative, isMoving: isMoving, constrained: constrained))
+            let rightRate = Int(preferredRate(nativeMaximum: rightNative, isMoving: isMoving, constrained: constrained))
+            if leftRate != rightRate { return leftRate > rightRate }
+            // ceil(native / rate) is the longest number of native ticks between
+            // delivered frames; integer arithmetic handles exact divisors.
+            let leftGap = Double((leftNative - 1) / leftRate + 1) / Double(leftNative)
+            let rightGap = Double((rightNative - 1) / rightRate + 1) / Double(rightNative)
+            if abs(leftGap - rightGap) > 1e-12 { return leftGap < rightGap }
+            return $0.id < $1.id
+        }.first?.id
+    }
+
     static func preferredRate(nativeMaximum: Int, isMoving: Bool, constrained: Bool) -> Double {
         let limit = constrained ? 30 : (isMoving ? 120 : 60)
         return Double(min(max(1, nativeMaximum), limit))

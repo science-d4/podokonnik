@@ -588,6 +588,80 @@ struct CoreTests {
                 advance(world, 0.2)
                 try require(!world.balls.contains { $0.id == left }, "Escaped ball must be removed from world bounds")
             }),
+            ("free balls leave the physical display without occupying the limit", {
+                let display = CGRect(x: 0, y: 0, width: 600, height: 400)
+                let trajectories: [(CGPoint, CGVector)] = [
+                    (CGPoint(x: 580, y: 380), CGVector(dx: 500, dy: 0)),
+                    (CGPoint(x: 20, y: 380), CGVector(dx: -500, dy: 0)),
+                    (CGPoint(x: 300, y: 20), CGVector(dx: 0, dy: -500))
+                ]
+                for (position, velocity) in trajectories {
+                    let world = filled()
+                    world.prune(to: [display])
+                    let id = try create(world, x: 300); world.endDrag()
+                    try place(world, id: id, at: position)
+                    _ = world.beginDrag(at: position)
+                    world.endDrag(velocity: velocity)
+                    advance(world, 2, regions: [display])
+                    try require(!world.balls.contains { $0.id == id }, "A thrown ball beyond the display must be removed")
+                }
+            }),
+            ("a ball above the display returns under gravity", {
+                let display = CGRect(x: 0, y: 0, width: 600, height: 400)
+                let world = filled()
+                world.prune(to: [display])
+                let id = try create(world, x: 300); world.endDrag()
+                try place(world, id: id, at: CGPoint(x: 300, y: 380))
+                _ = world.beginDrag(at: CGPoint(x: 300, y: 380))
+                world.endDrag(velocity: CGVector(dx: 0, dy: 500))
+                advance(world, 0.5, regions: [display])
+                guard let above = world.balls.first(where: { $0.id == id }) else {
+                    throw CoreFailure(description: "The ball must not be removed above the display")
+                }
+                try require(above.position.y - above.radius > display.maxY, "The ball must rise entirely above the display")
+                advance(world, 2, regions: [display])
+                guard let returned = world.balls.first(where: { $0.id == id }) else {
+                    throw CoreFailure(description: "The returning ball must remain in the world")
+                }
+                try require(returned.position.y < display.maxY, "Gravity must bring the ball back onto the display")
+            }),
+            ("a free ball crosses the gap between active displays", {
+                let left = CGRect(x: 0, y: 0, width: 600, height: 1000)
+                let right = CGRect(x: 1000, y: 0, width: 600, height: 1000)
+                let world = filled()
+                world.prune(to: [left, right])
+                let id = try create(world, x: 300); world.endDrag()
+                try place(world, id: id, at: CGPoint(x: 580, y: 800))
+                _ = world.beginDrag(at: CGPoint(x: 580, y: 800))
+                world.endDrag(velocity: CGVector(dx: 500, dy: 0))
+                advance(world, 1, regions: [left, right])
+                guard let ball = world.balls.first(where: { $0.id == id }) else {
+                    throw CoreFailure(description: "The ball must survive crossing the display gap")
+                }
+                try require(ball.position.x > right.minX, "The ball must continue moving across the gap")
+            }),
+            ("a ball in the display gap resumes when the nearest display resumes", {
+                let left = CGRect(x: 0, y: 0, width: 600, height: 1000)
+                let right = CGRect(x: 1000, y: 0, width: 600, height: 1000)
+                let world = filled()
+                world.prune(to: [left, right])
+                let id = try create(world, x: 300); world.endDrag()
+                try place(world, id: id, at: CGPoint(x: 580, y: 800))
+                _ = world.beginDrag(at: CGPoint(x: 580, y: 800))
+                world.endDrag(velocity: CGVector(dx: 500, dy: 0))
+                advance(world, 1, regions: [left])
+                let paused = world.balls.first { $0.id == id }!
+                try require(paused.position.x > left.maxX && paused.position.x < right.minX,
+                            "The ball pauses in the gap near the inactive display")
+                advance(world, 0.5, regions: [left])
+                try require(world.balls.first { $0.id == id }!.position == paused.position,
+                            "The gap ball remains paused without losing velocity")
+                advance(world, 1, regions: [left, right])
+                guard let resumed = world.balls.first(where: { $0.id == id }) else {
+                    throw CoreFailure(description: "The gap ball must survive display resumption")
+                }
+                try require(resumed.position.x > right.minX, "The gap ball resumes and reaches the active display")
+            }),
             ("stable snowball joins compress once and survive lift release", {
                 try close(SnowballContact.stackedCenterDistance(radius: 8, otherRadius: 8), 15.04,
                           "Small balls overlap by twelve percent of the smaller radius")
@@ -701,6 +775,33 @@ struct CoreTests {
                 try require(world.balls[0].position == ball.position, "Fullscreen on other display must not move objects")
                 world.prune(to: [CGRect(x: 0, y: 0, width: 1000, height: 1000)])
                 try require(world.balls.isEmpty && world.surfaces.isEmpty, "Unplug must prune offscreen state")
+            }),
+            ("free ball on a lower inactive display remains paused", {
+                let lower = CGRect(x: 0, y: 0, width: 600, height: 400)
+                let upper = CGRect(x: 0, y: 400, width: 600, height: 400)
+                let world = filled()
+                world.prune(to: [lower, upper])
+                let id = try create(world, x: 300); world.endDrag()
+                try place(world, id: id, at: CGPoint(x: 300, y: 200))
+                _ = world.beginDrag(at: CGPoint(x: 300, y: 200))
+                world.endDrag(velocity: CGVector(dx: 50, dy: -50))
+                let before = world.balls.first { $0.id == id }!
+                advance(world, 1, regions: [upper])
+                guard let after = world.balls.first(where: { $0.id == id }) else {
+                    throw CoreFailure(description: "A ball on an inactive connected display must not be removed")
+                }
+                try require(after.position == before.position && after.velocity == before.velocity,
+                            "A free ball on an inactive display keeps its position and velocity")
+                try place(world, id: id, at: CGPoint(x: 300, y: 850))
+                _ = world.beginDrag(at: CGPoint(x: 300, y: 850))
+                world.endDrag(velocity: CGVector(dx: 0, dy: 100))
+                let above = world.balls.first { $0.id == id }!
+                advance(world, 1, regions: [lower])
+                guard let pausedAbove = world.balls.first(where: { $0.id == id }) else {
+                    throw CoreFailure(description: "A ball above an inactive display must not be removed")
+                }
+                try require(pausedAbove.position == above.position && pausedAbove.velocity == above.velocity,
+                            "A ball above an inactive display remains paused")
             }),
             ("partial-display pause freezes profile", {
                 let world = filled()
