@@ -41,6 +41,137 @@ enum WindowMotionTests {
                 detector.reset()
                 try require(!detector.isDragging, "session reset releases the pause")
             }),
+            ("Mission Control retains window geometry throughout a long selection", {
+                let original = window(), other = window("other", x: 650)
+                let floor = window("floor", width: 1400, height: 1, kind: .floor)
+                let miniature = window(x: 120, y: 300, width: 300, height: 150)
+                let newMiniature = window("new", x: 500, y: 300, width: 300, height: 150)
+                var animations = WindowSurfaceAnimations()
+                var surfaces = [original, other, floor]
+                for (time, pressed) in [(0.0, false), (0.15, false), (5.0, false), (10.0, true)] {
+                    surfaces = animations.reconcile([miniature, newMiniature, floor], previous: surfaces,
+                        hiddenIDs: [], pointerPressed: pressed, missionControlActive: true, at: time)
+                    try require(surfaces.first(where: { $0.id == original.id })?.frame == original.frame
+                                && surfaces.first(where: { $0.id == original.id })?.isVisible == false,
+                                "a stationary thumbnail and mouse selection must never replace the stored frame")
+                    try require(surfaces.first(where: { $0.id == other.id })?.frame == other.frame
+                                && surfaces.first(where: { $0.id == other.id })?.isVisible == false,
+                                "an unreported window keeps its hidden original frame")
+                    try require(!surfaces.contains(where: { $0.id == newMiniature.id })
+                                && surfaces.contains(where: { $0.id == floor.id }),
+                                "new thumbnails do not create supports and the floor remains available")
+                }
+                let restored = animations.reconcile([original, other, floor], previous: surfaces,
+                    hiddenIDs: [], pointerPressed: true, at: 10.01)
+                try require(restored.first(where: { $0.id == original.id })?.frame == original.frame
+                            && restored.first(where: { $0.id == original.id })?.isVisible == true
+                            && restored.first(where: { $0.id == other.id })?.isVisible == true,
+                            "the original geometry returns immediately after Mission Control")
+            }),
+            ("resize before Mission Control signal waits for stability", {
+                let original = window()
+                let display = CGRect(x: 0, y: 0, width: 1400, height: 900)
+                let thumbnail = window(x: 0, y: 100, width: 300, height: 300)
+                var animations = WindowSurfaceAnimations()
+                let first = animations.reconcile([thumbnail], previous: [original], hiddenIDs: [],
+                    displays: [display], pointerPressed: false, at: 0)
+                try require(first.first?.frame == original.frame && first.first?.isVisible == false,
+                            "a horizontal shrink cannot change the stored geometry in its first frame")
+                let beforeSignal = animations.reconcile([thumbnail], previous: first, hiddenIDs: [],
+                    displays: [display], pointerPressed: false, at: 0.15)
+                try require(beforeSignal.first?.frame == original.frame && beforeSignal.first?.isVisible == false,
+                            "a stationary thumbnail remains uncommitted after an idle polling interval")
+                animations.resetForSpaceChange()
+                let spaceNotification = animations.reconcile([thumbnail], previous: beforeSignal, hiddenIDs: [],
+                    displays: [display], pointerPressed: false, spaceChanging: true, at: 0.16)
+                try require(spaceNotification.first?.frame == original.frame && spaceNotification.first?.isVisible == false,
+                            "a Space notification cannot shorten an already pending resize interval")
+                let overview = animations.reconcile([thumbnail], previous: spaceNotification, hiddenIDs: [],
+                    displays: [display], pointerPressed: false, missionControlActive: true, at: 0.17)
+                let held = animations.reconcile([thumbnail], previous: overview, hiddenIDs: [],
+                    displays: [display], pointerPressed: true, missionControlActive: true, at: 5)
+                try require(held.first?.frame == original.frame && held.first?.isVisible == false,
+                            "the later Mission Control signal must retain the original frame")
+
+                var ordinary = WindowSurfaceAnimations()
+                let verticalResize = window(x: 0, y: 100, width: 600, height: 200)
+                let pending = ordinary.reconcile([verticalResize], previous: [original], hiddenIDs: [],
+                    displays: [display], pointerPressed: false, at: 1)
+                let settled = ordinary.reconcile([verticalResize], previous: pending, hiddenIDs: [],
+                    displays: [display], pointerPressed: false, at: 1.31)
+                try require(pending.first?.frame == original.frame && pending.first?.isVisible == false
+                            && settled.first?.frame == verticalResize.frame && settled.first?.isVisible == true,
+                            "a programmatic height-only resize commits once stable")
+                var manual = WindowSurfaceAnimations()
+                let dragged = manual.reconcile([thumbnail], previous: [original], hiddenIDs: [],
+                    displays: [display], pointerPressed: true, at: 2)
+                try require(dragged.first?.frame == thumbnail.frame && dragged.first?.isVisible == true,
+                            "a user resize is still immediate")
+            }),
+            ("Space before a thumbnail cannot shorten resize protection", {
+                let original = window()
+                let display = CGRect(x: 0, y: 0, width: 1400, height: 900)
+                let thumbnail = window(x: 0, y: 100, width: 300, height: 300)
+                for initiallyVisible in [true, false] {
+                    var animations = WindowSurfaceAnimations()
+                    var stored = original
+                    stored.isVisible = initiallyVisible
+                    animations.resetForSpaceChange()
+                    let first = animations.reconcile([thumbnail], previous: [stored], hiddenIDs: [],
+                        displays: [display], pointerPressed: false, spaceChanging: true, at: 0)
+                    let next = animations.reconcile([thumbnail], previous: first, hiddenIDs: [],
+                        displays: [display], pointerPressed: false, spaceChanging: true, at: 0.15)
+                    try require(next.first?.frame == original.frame && next.first?.isVisible == false,
+                                "a Space notification before resize must not commit a thumbnail at 150 ms")
+                    let overview = animations.reconcile([thumbnail], previous: next, hiddenIDs: [],
+                        displays: [display], pointerPressed: false, missionControlActive: true, at: 0.16)
+                    let held = animations.reconcile([thumbnail], previous: overview, hiddenIDs: [],
+                        displays: [display], pointerPressed: true, missionControlActive: true, at: 5)
+                    try require(held.first?.frame == original.frame && held.first?.isVisible == false,
+                                "Mission Control must preserve the original geometry after the Space notification")
+                }
+            }),
+            ("Mission Control recovery confirms changed sizes before committing", {
+                let original = window()
+                let display = CGRect(x: 0, y: 0, width: 1400, height: 900)
+                var animations = WindowSurfaceAnimations()
+                let hidden = animations.reconcile([window(x: 100, y: 300, width: 300, height: 150)],
+                    previous: [original], hiddenIDs: [], displays: [display], pointerPressed: false,
+                    missionControlActive: true, at: 0)
+                animations.resetForSpaceChange()
+                let resized = window(x: 25, y: 100, width: 601, height: 301)
+                let first = animations.reconcile([resized], previous: hidden, hiddenIDs: [],
+                    displays: [display], pointerPressed: true, spaceChanging: true, at: 5)
+                try require(first.first?.frame == original.frame && first.first?.isVisible == false,
+                            "even a one-point change waits for a stable final size during recovery")
+                let changed = window(x: 25, y: 100, width: 620, height: 310)
+                let second = animations.reconcile([changed], previous: first, hiddenIDs: [],
+                    displays: [display], pointerPressed: true, at: 5.05)
+                try require(second.first?.frame == original.frame && second.first?.isVisible == false,
+                            "a changing final frame restarts the stability interval")
+                let stillPending = animations.reconcile([changed], previous: second, hiddenIDs: [],
+                    displays: [display], pointerPressed: true, spaceChanging: true, at: 5.20)
+                try require(stillPending.first?.frame == original.frame && stillPending.first?.isVisible == false,
+                            "a stationary post-Mission-Control frame waits beyond one idle polling interval")
+                let final = animations.reconcile([changed], previous: stillPending, hiddenIDs: [],
+                    displays: [display], pointerPressed: true, at: 5.36)
+                try require(final.first?.frame == changed.frame && final.first?.isVisible == true,
+                            "a stable changed frame eventually becomes the actual support")
+
+                let manualResize = window(x: 25, y: 100, width: 640, height: 310)
+                let manual = animations.reconcile([manualResize], previous: final, hiddenIDs: [],
+                    displays: [display], pointerPressed: true, at: 6)
+                try require(manual.first?.frame == manualResize.frame && manual.first?.isVisible == true,
+                            "recovery ends and a later manual resize remains immediate")
+                let programmaticResize = window(x: 25, y: 120, width: 650, height: 310)
+                let pending = animations.reconcile([programmaticResize], previous: manual, hiddenIDs: [],
+                    displays: [display], pointerPressed: false, at: 7)
+                let settled = animations.reconcile([programmaticResize], previous: pending, hiddenIDs: [],
+                    displays: [display], pointerPressed: false, at: 7.31)
+                try require(pending.first?.isVisible == false && settled.first?.frame == programmaticResize.frame
+                            && settled.first?.isVisible == true,
+                            "ordinary programmatic resize still commits once stable")
+            }),
             ("returning window snow follows the horizontal Space animation before the notification", {
                 let original = window()
                 let display = CGRect(x: 0, y: 0, width: 1400, height: 900)
@@ -94,7 +225,7 @@ enum WindowMotionTests {
                 try require(second.first?.isVisible == false && second.first?.frame == original.frame,
                             "changed intermediate bounds must restart the stability check")
                 let settled = animations.reconcile([intermediate], previous: second, hiddenIDs: [],
-                                                  displays: [display], pointerPressed: false, spaceChanging: true, at: 6.14)
+                                                  displays: [display], pointerPressed: false, spaceChanging: true, at: 6.36)
                 try require(settled.first?.isVisible == true && settled.first?.frame == intermediate.frame,
                             "stable geometry must reveal the window while Space protection is still active")
             }),
@@ -128,7 +259,7 @@ enum WindowMotionTests {
                             "normal pointer resize publishes geometry immediately")
                 let final = window(x: 30, y: 140, width: 350)
                 let pending = reconcile([final], old: dragged, at: 3)
-                let settled = reconcile([final], old: pending, at: 3.09)
+                let settled = reconcile([final], old: pending, at: 3.31)
                 try require(pending.first?.isVisible == false && settled.first?.frame == final.frame
                             && settled.first?.isVisible == true, "a stable new frame eventually commits a programmatic resize")
                 try require(reconcile([], old: settled, at: 4).isEmpty, "an destroyed window no longer retains support")

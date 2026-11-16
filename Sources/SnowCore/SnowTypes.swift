@@ -48,7 +48,7 @@ struct SnowSurface {
     /// For a floor captured from the desktop, the masks owned by system panels
     /// and other overlays. Ordinary windows remain part of `occluders` for snow.
     var floorOverlayOccluders: [CGRect]?
-    /// Set only for the frontmost application's foremost ordinary window.
+    /// The active ordinary window, retained briefly while Spotlight has focus.
     var suppressesSnowfall = false
     var top: CGFloat { frame.maxY }
     func supports(x: CGFloat) -> Bool {
@@ -363,6 +363,7 @@ struct DesktopSnapshot {
     var captureMilliseconds: Double
     var hiddenWindowSupportIDs: Set<String> = []
     var screenshotSelectionActive = false
+    var missionControlActive = false
 }
 
 enum WorldCoordinates {

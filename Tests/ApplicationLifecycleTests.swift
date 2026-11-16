@@ -413,7 +413,7 @@ private final class LifecycleChecks {
         try verify(controller.world.surfaces.first?.isVisible == false
                    && controller.world.drifts[support.id]?.heights == spaceSnow,
                    "the first resized frame must keep the hidden drift intact after five seconds away")
-        await drain(for: 0.09)
+        await drain(for: 0.31)
         controller.desktop.onSnapshot?(resizedReturn)
         try verify(controller.world.surfaces.first?.isVisible == true
                    && controller.world.surfaces.first?.frame == resizedReturn.surfaces[0].frame
@@ -422,7 +422,7 @@ private final class LifecycleChecks {
                    && controller.festiveWorld.placements(in: controller.world).first?.id == retainedTree,
                    "a stable resized window must show its snowman and tree during Space protection")
         controller.desktop.onSnapshot?(ownSnapshot)
-        await drain(for: 0.09)
+        await drain(for: 0.31)
         controller.desktop.onSnapshot?(ownSnapshot)
         try verify(controller.world.surfaces.first?.isVisible == true
                    && controller.world.drifts[support.id]?.heights.contains(where: { $0 > 0 }) == true,
@@ -430,6 +430,7 @@ private final class LifecycleChecks {
         let returnedSnow = controller.world.drifts[support.id]?.heights
         let returnedTree = controller.festiveWorld.placements(in: controller.world).first
         controller.desktop.onSnapshot?(otherSpace)
+        center.post(name: NSWorkspace.activeSpaceDidChangeNotification, object: NSWorkspace.shared)
         var returning = ownSnapshot
         returning.surfaces[0].frame = CGRect(x: support.frame.minX + 24, y: support.frame.minY + 3,
                                            width: support.frame.width + 1, height: support.frame.height + 1)
@@ -456,6 +457,26 @@ private final class LifecycleChecks {
                    && controller.festiveWorld.placements(in: controller.world).first?.id == retainedTree
                    && controller.festiveWorld.placements(in: controller.world).first?.base == returnedTree?.base,
                    "the returning support must restore its exact drift, snowman and tree position")
+        var mission = ownSnapshot
+        mission.missionControlActive = true
+        mission.surfaces[0].frame = CGRect(x: support.frame.minX + 40, y: support.frame.minY + 30,
+                                           width: support.frame.width * 0.5, height: support.frame.height * 0.5)
+        controller.desktop.onSnapshot?(mission)
+        await drain(for: 0.2)
+        controller.primaryPointerDown = { true }
+        controller.desktop.onSnapshot?(mission)
+        try verify(controller.world.surfaces.first?.isVisible == false
+                   && controller.world.drifts[support.id]?.heights == returnedSnow
+                   && controller.world.snowmen.first?.ballIDs == snowman
+                   && controller.festiveWorld.placements(in: controller.world).first?.base == returnedTree?.base,
+                   "a stable Mission Control thumbnail and mouse selection must preserve the full snow and tree anchor")
+        controller.primaryPointerDown = { false }
+        controller.desktop.onSnapshot?(ownSnapshot)
+        try verify(controller.world.surfaces.first?.isVisible == true
+                   && controller.world.drifts[support.id]?.heights == returnedSnow
+                   && controller.festiveWorld.placements(in: controller.world).first?.base == returnedTree?.base,
+                   "returning from Mission Control restores the exact profile and tree position")
+        controller.primaryPointerDown = { NSEvent.pressedMouseButtons & 1 != 0 }
         await drain(for: 0.7)
         otherSpace.hiddenWindowSupportIDs = []
         controller.desktop.onSnapshot?(otherSpace)

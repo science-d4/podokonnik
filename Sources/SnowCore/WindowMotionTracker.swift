@@ -6,16 +6,34 @@ struct WindowSurfaceAnimations {
     private struct Sample {
         var frame: CGRect
         var stableSince: TimeInterval
+        var minimumStability: TimeInterval
     }
 
     private var animated: [String: Sample] = [:]
+    private var missionRecovery: Set<String> = []
 
-    /// CG supplies no public animation flag. A translating resize outside a
+    mutating func resetForSpaceChange() {
+        animated = animated.filter { $0.value.minimumStability >= 0.30 }
+    }
+
+    /// CG supplies no public animation flag. A substantial resize outside a
     /// pointer drag, a changed frame reappearing from a hidden state and
     /// changed bounds during a Space transition need a stable sample.
     mutating func reconcile(_ incoming: [SnowSurface], previous: [SnowSurface], hiddenIDs: Set<String>,
                             displays: [CGRect] = [], pointerPressed: Bool, spaceChanging: Bool = false,
+                            missionControlActive: Bool = false,
                             at time: TimeInterval) -> [SnowSurface] {
+        if missionControlActive {
+            animated.removeAll()
+            missionRecovery = Set(previous.filter { $0.kind == .window }.map(\.id))
+            let otherSurfaces = incoming.filter { $0.kind != .window && !hiddenIDs.contains($0.id) }
+            let retained = previous.filter { $0.kind == .window }.map { surface in
+                var hidden = surface
+                hidden.isVisible = false
+                return hidden
+            }
+            return otherSurfaces + retained
+        }
         let old = Dictionary(uniqueKeysWithValues: previous.map { ($0.id, $0) })
         var next: [String: Sample] = [:]
         var surfaces: [SnowSurface] = []
@@ -36,6 +54,7 @@ struct WindowSurfaceAnimations {
                 let movingHorizontally = !pointerPressed && frame.minX != stored.frame.minX
                 let returningOnSameEdge = (!stored.isVisible || movingHorizontally) && abs(frame.maxY - stored.top) <= 2
                 if onDisplay, surface.isVisible, spaceChanging || returningOnSameEdge,
+                   !missionRecovery.contains(surface.id) || frame.size == stored.frame.size,
                    abs(frame.width - stored.frame.width) <= 2, abs(frame.height - stored.frame.height) <= 2 {
                     // Trust current visibility and position. Keep the original
                     // dimensions while CG is rounding the window's bounds.
@@ -43,15 +62,19 @@ struct WindowSurfaceAnimations {
                                            width: stored.frame.width, height: stored.frame.height)
                     surface.topInset = stored.topInset
                     surfaces.append(surface)
+                    missionRecovery.remove(surface.id)
                     continue
                 }
-                let movingY = (frame.minY > stored.frame.minY && frame.maxY > stored.frame.maxY)
-                    || (frame.minY < stored.frame.minY && frame.maxY < stored.frame.maxY)
-                let translatingResize = movingY && frame.width != stored.frame.width
-                if spaceChanging || animated[surface.id] != nil || !stored.isVisible || (translatingResize && !pointerPressed) {
-                    let sample = animated[surface.id].flatMap { $0.frame == frame ? $0 : nil }
-                        ?? Sample(frame: frame, stableSince: time)
-                    if time - sample.stableSince < 0.08 || (spaceChanging && !onDisplay) {
+                let substantialResize = abs(frame.width - stored.frame.width) > 2
+                    || abs(frame.height - stored.frame.height) > 2
+                if spaceChanging || missionRecovery.contains(surface.id) || animated[surface.id] != nil
+                    || !stored.isVisible || (substantialResize && !pointerPressed) {
+                    let minimumStability = spaceChanging && !substantialResize
+                        && !missionRecovery.contains(surface.id) ? 0.08 : 0.30
+                    var sample = animated[surface.id].flatMap { $0.frame == frame ? $0 : nil }
+                        ?? Sample(frame: frame, stableSince: time, minimumStability: minimumStability)
+                    sample.minimumStability = max(sample.minimumStability, minimumStability)
+                    if time - sample.stableSince < sample.minimumStability || (spaceChanging && !onDisplay) {
                         next[surface.id] = sample
                         hidden.insert(surface.id)
                         continue
@@ -59,12 +82,14 @@ struct WindowSurfaceAnimations {
                 }
             }
             surfaces.append(surface)
+            missionRecovery.remove(surface.id)
         }
         animated = next
         for var stored in previous where hidden.contains(stored.id) {
             stored.isVisible = false
             surfaces.append(stored)
         }
+        missionRecovery.formIntersection(Set(surfaces.map(\.id)))
         return surfaces
     }
 }

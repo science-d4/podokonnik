@@ -58,10 +58,14 @@ struct DesktopTests {
         geometry()
         ceilingSupports()
         wideWindowPolicy()
+        spotlightFocus()
+        spotlightCapture()
         dockSupports()
         dockContact()
         cursorOcclusion()
         nativeMenuAndScreenshotGeometry()
+        missionControlGeometry()
+        missionControlCapture()
         hiddenWindowSupports()
         applicationMetadataCache()
         captureTiming()
@@ -146,6 +150,150 @@ struct DesktopTests {
         expect(DesktopGeometry.activeWindowID(ordered: order, frontmostPID: 300) == nil
                && DesktopGeometry.activeWindowID(ordered: order, frontmostPID: nil) == nil,
                "missing active normal window never leaves a stale suppression ID")
+    }
+
+    private static func spotlightFocus() {
+        let display = CGRect(x: 0, y: 0, width: 1440, height: 900)
+        let frame = CGRect(x: 0, y: 100, width: 1440, height: 700)
+        var first = SnowSurface(id: "window:100:10", frame: frame, kind: .window)
+        var second = SnowSurface(id: "window:200:20", frame: frame, kind: .window)
+        var policy = DesktopFocusPolicy()
+        var surfaces = [first, second]
+        policy.apply(to: &surfaces, frontmostBundleIdentifier: "com.apple.Spotlight")
+        expect(WideWindowPolicy.snowfallMasks(surfaces: surfaces, display: display).isEmpty,
+               "starting in Spotlight must not invent an active window")
+
+        first.suppressesSnowfall = true
+        surfaces = [first, second]
+        policy.apply(to: &surfaces, frontmostBundleIdentifier: "example.first")
+        expect(WideWindowPolicy.snowfallMasks(surfaces: surfaces, display: display) == [frame],
+               "the active wide window initially suppresses snowfall")
+        first.suppressesSnowfall = false
+        for _ in 0..<3 {
+            surfaces = [first, second]
+            policy.apply(to: &surfaces, frontmostBundleIdentifier: "com.apple.Spotlight")
+            expect(surfaces[0].suppressesSnowfall && !surfaces[1].suppressesSnowfall
+                   && WideWindowPolicy.snowfallMasks(surfaces: surfaces, display: display) == [frame],
+                   "Spotlight pauses and input retain the same wide-window mask")
+        }
+        second.suppressesSnowfall = true
+        surfaces = [first, second]
+        policy.apply(to: &surfaces, frontmostBundleIdentifier: "example.second")
+        expect(!surfaces[0].suppressesSnowfall && surfaces[1].suppressesSnowfall,
+               "another application replaces the retained window")
+        second.suppressesSnowfall = false
+        surfaces = [first, second]
+        policy.apply(to: &surfaces, frontmostBundleIdentifier: "com.apple.Spotlight")
+        expect(!surfaces[0].suppressesSnowfall && surfaces[1].suppressesSnowfall,
+               "Spotlight retains the newly selected window")
+        surfaces = [first]
+        policy.apply(to: &surfaces, frontmostBundleIdentifier: "com.apple.Spotlight")
+        surfaces = [first, second]
+        policy.apply(to: &surfaces, frontmostBundleIdentifier: "com.apple.Spotlight")
+        expect(surfaces.allSatisfy { !$0.suppressesSnowfall },
+               "a disappeared window is not revived from stale focus")
+        first.suppressesSnowfall = true
+        surfaces = [first]
+        policy.apply(to: &surfaces, frontmostBundleIdentifier: "example.first")
+        first.suppressesSnowfall = false
+        surfaces = [first]
+        policy.apply(to: &surfaces, frontmostBundleIdentifier: "example.other")
+        policy.apply(to: &surfaces, frontmostBundleIdentifier: "com.apple.Spotlight")
+        expect(!surfaces[0].suppressesSnowfall,
+               "another app without an eligible window clears the previous selection")
+    }
+
+    private static func missionControlGeometry() {
+        let screen = CGRect(x: -1440, y: 0, width: 1440, height: 900)
+        let other = CGRect(x: 0, y: 0, width: 1920, height: 1080)
+        let dockLevel = Int(CGWindowLevelForKey(.dockWindow))
+        func detected(_ frame: CGRect, _ layer: Int, _ manager: Bool) -> Bool {
+            DesktopGeometry.isMissionControlWindow(frame, layer: layer, windowManager: manager,
+                                                   displays: [screen, other])
+        }
+        expect(detected(screen, dockLevel - 1, true),
+               "the full-screen WindowManager canvas identifies Mission Control on macOS 27")
+        expect(detected(screen.union(other), dockLevel - 1, true),
+               "a canvas covering multiple displays is recognized")
+        expect(!detected(screen, dockLevel, false)
+               && !detected(screen, dockLevel - 1, false)
+               && !detected(screen, dockLevel - 2, true),
+               "normal Dock canvases and unrelated owner/layer combinations are ignored")
+        expect(!detected(screen.insetBy(dx: 20, dy: 20), dockLevel - 1, true)
+               && !detected(screen, dockLevel - 1, false),
+               "a smaller panel or another process is not Mission Control")
+    }
+
+    private static func missionControlCapture() {
+        let display = DesktopDisplay(id: 1, frame: CGRect(x: 0, y: 0, width: 1440, height: 900), visibleTop: 876)
+        let manager: pid_t = 987125
+        let canvas: [String: Any] = [
+            kCGWindowOwnerPID as String: NSNumber(value: manager),
+            kCGWindowNumber as String: NSNumber(value: 987126),
+            kCGWindowBounds as String: display.frame.dictionaryRepresentation,
+            kCGWindowLayer as String: NSNumber(value: Int(CGWindowLevelForKey(.dockWindow)) - 1),
+            kCGWindowAlpha as String: NSNumber(value: 1)
+        ]
+        let metadata = TestWindowMetadata([])
+        let environment = DesktopEnvironment(windowMetadata: { metadata.read() }, displays: { [display] },
+            primaryDisplayTop: { display.frame.maxY }, applicationMetadata: {
+                DesktopApplicationMetadata(dockPID: nil, supportPIDs: [], windowManagerPIDs: [manager])
+            }, frontmostApplication: { DesktopFrontmostApplication(pid: nil, bundleIdentifier: nil) })
+        var snapshots: [DesktopSnapshot] = []
+        environment.onSnapshot = { snapshots.append($0) }
+        environment.start()
+        wait(until: { !snapshots.isEmpty })
+        expect(snapshots.last?.missionControlActive == false, "ordinary capture has no Mission Control flag")
+        metadata.set([canvas]); environment.refresh()
+        wait(until: { snapshots.last?.missionControlActive == true })
+        expect(snapshots.last?.missionControlActive == true, "system canvas propagates to the desktop snapshot")
+        metadata.set([]); environment.refresh()
+        wait(until: { snapshots.last?.missionControlActive == false })
+        expect(snapshots.last?.missionControlActive == false, "removing the canvas clears the desktop flag")
+        environment.stop()
+    }
+
+    private static func spotlightCapture() {
+        let display = DesktopDisplay(id: 1, frame: CGRect(x: 0, y: 0, width: 1440, height: 900), visibleTop: 876)
+        let pid: pid_t = 987120
+        let record: [String: Any] = [
+            kCGWindowOwnerPID as String: NSNumber(value: pid),
+            kCGWindowNumber as String: NSNumber(value: 987121),
+            kCGWindowBounds as String: CGRect(x: 0, y: 100, width: 1440, height: 700).dictionaryRepresentation,
+            kCGWindowLayer as String: NSNumber(value: 0),
+            kCGWindowAlpha as String: NSNumber(value: 1)
+        ]
+        let blocker = StalledWindowMetadata()
+        var frontmost = DesktopFrontmostApplication(pid: pid, bundleIdentifier: "example.first")
+        let environment = DesktopEnvironment(windowMetadata: { _ = blocker.read(); return [record] },
+                                             displays: { [display] }, primaryDisplayTop: { display.frame.maxY },
+                                             applicationMetadata: { DesktopApplicationMetadata(dockPID: nil, supportPIDs: [pid]) },
+                                             frontmostApplication: { frontmost })
+        var snapshots: [DesktopSnapshot] = []
+        environment.onSnapshot = { snapshots.append($0) }
+        environment.start()
+        wait(until: { !snapshots.isEmpty })
+        expect(snapshots.last?.surfaces.first(where: { $0.kind == .window })?.suppressesSnowfall == true,
+               "capture selects the active application's window")
+
+        blocker.blockNext()
+        environment.refresh()
+        wait(until: { blocker.isBlocked })
+        let before = snapshots.count
+        frontmost = DesktopFrontmostApplication(pid: 987122, bundleIdentifier: "com.apple.Spotlight")
+        blocker.unblock()
+        wait(until: { snapshots.count > before })
+        expect(snapshots.count > before && blocker.readCount >= 3,
+               "a capture started before a focus change is discarded and retried")
+        expect(snapshots.dropFirst(before).allSatisfy {
+            $0.surfaces.first(where: { $0.kind == .window })?.suppressesSnowfall == true
+        }, "delivered Spotlight snapshots retain the previously active wide window")
+        frontmost = DesktopFrontmostApplication(pid: 987123, bundleIdentifier: "example.other")
+        environment.refresh()
+        wait(until: { snapshots.last?.surfaces.first(where: { $0.kind == .window })?.suppressesSnowfall == false })
+        expect(snapshots.last?.surfaces.first(where: { $0.kind == .window })?.suppressesSnowfall == false,
+               "a different frontmost application clears the retained selection")
+        environment.stop()
     }
 
     private static func ceilingSupports() {

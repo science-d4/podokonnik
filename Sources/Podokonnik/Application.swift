@@ -370,6 +370,7 @@ final class ApplicationController: NSObject, NSApplicationDelegate, NSPopoverDel
         let trustLost = snapshot?.accessibilityTrusted == true && !new.accessibilityTrusted
         snapshot = new
         if trustLost { endGame(restoreFocus: false) }
+        if new.missionControlActive { endGame(restoreFocus: false) }
         policy.fullscreenDisplayIDs = new.fullscreenDisplayIDs
         let fullscreenFrames = overlays.values.filter { new.fullscreenDisplayIDs.contains($0.id) }.map { $0.window.frame }
         // Fullscreen geometry can temporarily replace the same window ID with
@@ -385,7 +386,8 @@ final class ApplicationController: NSObject, NSApplicationDelegate, NSPopoverDel
         let hiddenIDs = new.hiddenWindowSupportIDs.union(fullscreenSupports)
         let surfaces = windowAnimations.reconcile(new.surfaces, previous: world.surfaces, hiddenIDs: hiddenIDs,
             displays: overlays.values.map { $0.window.frame },
-            pointerPressed: pointerPressed, spaceChanging: spaceChanging, at: motionTime)
+            pointerPressed: pointerPressed, spaceChanging: spaceChanging,
+            missionControlActive: new.missionControlActive, at: motionTime)
         let shakes = windowShake.update(surfaces: surfaces, dragging: pointerPressed && !spaceChanging, at: motionTime)
         let draggingWindow = windowDrag.update(previous: world.surfaces, current: surfaces,
             pointerPressed: pointerPressed && !spaceChanging && playingDisplay == nil)
@@ -447,7 +449,8 @@ final class ApplicationController: NSObject, NSApplicationDelegate, NSPopoverDel
         updateRenderRates()
         let screens = NSScreen.screens
         for overlay in overlays.values {
-            let allowed = policy.isVisible(displayID: overlay.id) && overlay.renderingFailure == nil && !geometryUnavailable
+            let allowed = policy.isVisible(displayID: overlay.id) && snapshot?.missionControlActive != true
+                && overlay.renderingFailure == nil && !geometryUnavailable
             let geometryReady = !awaitingFreshSnapshot
             overlay.scene.weather = weather
             overlay.scene.decorationOptions = settings.decorations
@@ -478,7 +481,7 @@ final class ApplicationController: NSObject, NSApplicationDelegate, NSPopoverDel
     private func spaceChanged() {
         awaitingFreshSnapshot = true
         spaceGeometryUntil = ProcessInfo.processInfo.systemUptime + 0.65
-        windowAnimations = WindowSurfaceAnimations()
+        windowAnimations.resetForSpaceChange()
         resetWindowMotion(); snowplowSchedule.cancelPasses()
         duckWorld.clear(preserveMemory: true)
         overlays.values.forEach { $0.scene.snowplowPasses = [:] }

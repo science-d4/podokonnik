@@ -38,11 +38,13 @@ final class DesktopEnvironment {
     private var lastDockPID: pid_t?
     private var previousFrames: [String: CGRect] = [:]
     private var trackedWindowSupports: [UInt32: pid_t] = [:]
+    private var focusPolicy = DesktopFocusPolicy()
     private var captureTiming = DesktopCaptureTiming()
     private let windowMetadata: () -> [[String: Any]]?
     private let displays: () -> [DesktopDisplay]
     private let primaryDisplayTop: () -> CGFloat
     private let applicationMetadata: () -> DesktopApplicationMetadata
+    private let frontmostApplication: () -> DesktopFrontmostApplication
     private let watchdogTime: () -> TimeInterval
     private let watchdogSchedule: (TimeInterval) -> DispatchTime
 
@@ -56,12 +58,16 @@ final class DesktopEnvironment {
     }, primaryDisplayTop: @escaping () -> CGFloat = { NSScreen.screens.first?.frame.maxY ?? 0 },
        applicationMetadata: @escaping () -> DesktopApplicationMetadata = {
         DesktopApplicationMetadata.read(NSWorkspace.shared.runningApplications)
+    }, frontmostApplication: @escaping () -> DesktopFrontmostApplication = {
+        let application = NSWorkspace.shared.frontmostApplication
+        return DesktopFrontmostApplication(pid: application?.processIdentifier, bundleIdentifier: application?.bundleIdentifier)
     }, watchdogTime: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
        watchdogSchedule: @escaping (TimeInterval) -> DispatchTime = { .now() + $0 }) {
         self.windowMetadata = windowMetadata
         self.displays = displays
         self.primaryDisplayTop = primaryDisplayTop
         self.applicationMetadata = applicationMetadata
+        self.frontmostApplication = frontmostApplication
         self.watchdogTime = watchdogTime
         self.watchdogSchedule = watchdogSchedule
     }
@@ -79,6 +85,7 @@ final class DesktopEnvironment {
         running = true
         generation &+= 1
         captureTiming.reset()
+        focusPolicy = DesktopFocusPolicy()
         previousFrames.removeAll()
         applicationCache.invalidate()
         observeApplications()
@@ -159,11 +166,17 @@ final class DesktopEnvironment {
         // separately from fast window geometry, expiring them within one second.
         let applications = applicationCache.snapshot(now: ProcessInfo.processInfo.systemUptime, load: applicationMetadata)
         let token = DesktopCaptureCancellation()
+        let frontmost = frontmostApplication()
         let context = DesktopCaptureContext(
             generation: generation, displays: displays, primaryTop: primaryTop,
             ownPID: ProcessInfo.processInfo.processIdentifier, dockPID: applications.dockPID,
-            frontmostPID: NSWorkspace.shared.frontmostApplication?.processIdentifier,
+            frontmost: frontmost,
             supportPIDs: applications.supportPIDs, notificationCenterPIDs: applications.notificationCenterPIDs,
+            // A newly launched WindowManager must not wait for the one-second
+            // general application-cache expiry during Mission Control entry.
+            windowManagerPIDs: applications.windowManagerPIDs.union(
+                NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.WindowManager")
+                    .map(\.processIdentifier)),
             excludedWindowIDs: excludedWindowIDs, trackedWindowSupports: trackedWindowSupports
         )
         inFlight = true
@@ -244,6 +257,12 @@ final class DesktopEnvironment {
             refresh()
             return
         }
+        // Do not publish a capture made for an application that lost focus
+        // while WindowServer was being queried.
+        guard context.frontmost == frontmostApplication() else {
+            refresh()
+            return
+        }
         if !result.hasWindowMetadata && !context.displays.isEmpty {
             // No geometry is better than an incomplete snapshot: the latter
             // deletes the Dock and loses all window occlusion masks.
@@ -255,8 +274,13 @@ final class DesktopEnvironment {
             return
         }
         var snapshot = result.snapshot
+        focusPolicy.apply(to: &snapshot.surfaces, frontmostBundleIdentifier: context.frontmost.bundleIdentifier)
         if result.hasWindowMetadata {
-            trackedWindowSupports = result.windowSupports
+            if snapshot.missionControlActive {
+                trackedWindowSupports.merge(result.windowSupports) { _, current in current }
+            } else {
+                trackedWindowSupports = result.windowSupports
+            }
         } else {
             // A failed metadata read gives no evidence that an existing window closed.
             snapshot.hiddenWindowSupportIDs = Set(trackedWindowSupports.map {
@@ -494,6 +518,7 @@ struct DesktopApplicationMetadata {
     var dockPID: pid_t?
     var supportPIDs: Set<pid_t>
     var notificationCenterPIDs: Set<pid_t> = []
+    var windowManagerPIDs: Set<pid_t> = []
 
     static func read(_ applications: [NSRunningApplication]) -> Self {
         var result = Self(dockPID: nil, supportPIDs: [])
@@ -501,12 +526,14 @@ struct DesktopApplicationMetadata {
             let bundle = application.bundleIdentifier
             let isDock = bundle == "com.apple.dock"
             let isNotificationCenter = bundle == "com.apple.notificationcenterui"
+            let isWindowManager = bundle == "com.apple.WindowManager"
             let visibleRegular = application.activationPolicy == .regular && !application.isHidden
-            let terminated = (visibleRegular || isNotificationCenter || isDock) ? application.isTerminated : false
-            guard !terminated && (isDock || isNotificationCenter || visibleRegular) else { continue }
+            let terminated = (visibleRegular || isNotificationCenter || isDock || isWindowManager) ? application.isTerminated : false
+            guard !terminated && (isDock || isNotificationCenter || isWindowManager || visibleRegular) else { continue }
             let pid = application.processIdentifier
             if isDock && result.dockPID == nil { result.dockPID = pid }
             if isNotificationCenter { result.notificationCenterPIDs.insert(pid) }
+            if isWindowManager { result.windowManagerPIDs.insert(pid) }
             if visibleRegular { result.supportPIDs.insert(pid) }
         }
         return result
@@ -534,9 +561,11 @@ struct DesktopApplicationCache {
         let fresh = load(pid)
         current.supportPIDs.remove(pid)
         current.notificationCenterPIDs.remove(pid)
+        current.windowManagerPIDs.remove(pid)
         if current.dockPID == pid { current.dockPID = nil }
         if fresh.supportPIDs.contains(pid) { current.supportPIDs.insert(pid) }
         if fresh.notificationCenterPIDs.contains(pid) { current.notificationCenterPIDs.insert(pid) }
+        if fresh.windowManagerPIDs.contains(pid) { current.windowManagerPIDs.insert(pid) }
         if fresh.dockPID == pid { current.dockPID = pid }
         value = current
     }
@@ -588,15 +617,41 @@ struct DesktopDisplay {
     let visibleTop: CGFloat
 }
 
+struct DesktopFrontmostApplication: Equatable {
+    let pid: pid_t?
+    let bundleIdentifier: String?
+}
+
+/// Spotlight temporarily owns keyboard focus without replacing the underlying
+/// ordinary window. Keep its snowfall state only while that exact window exists.
+struct DesktopFocusPolicy {
+    private var lastActiveWindowID: String?
+
+    mutating func apply(to surfaces: inout [SnowSurface], frontmostBundleIdentifier: String?) {
+        if frontmostBundleIdentifier == "com.apple.Spotlight" {
+            for index in surfaces.indices { surfaces[index].suppressesSnowfall = false }
+            guard let id = lastActiveWindowID,
+                  let index = surfaces.firstIndex(where: { $0.kind == .window && $0.isVisible && $0.id == id }) else {
+                lastActiveWindowID = nil
+                return
+            }
+            surfaces[index].suppressesSnowfall = true
+        } else {
+            lastActiveWindowID = surfaces.first(where: { $0.kind == .window && $0.isVisible && $0.suppressesSnowfall })?.id
+        }
+    }
+}
+
 private struct DesktopCaptureContext {
     let generation: UInt64
     let displays: [DesktopDisplay]
     let primaryTop: CGFloat
     let ownPID: pid_t
     let dockPID: pid_t?
-    let frontmostPID: pid_t?
+    let frontmost: DesktopFrontmostApplication
     let supportPIDs: Set<pid_t>
     let notificationCenterPIDs: Set<pid_t>
+    let windowManagerPIDs: Set<pid_t>
     let excludedWindowIDs: Set<UInt32>
     let trackedWindowSupports: [UInt32: pid_t]
 }
@@ -671,6 +726,11 @@ private enum DesktopCapture {
         }
 
         let displayFrames = context.displays.map(\.frame)
+        let missionControlActive = records.contains { record in
+            DesktopGeometry.isMissionControlWindow(record.frame, layer: record.layer,
+                windowManager: context.windowManagerPIDs.contains(record.pid),
+                displays: displayFrames)
+        }
         let notificationCanvases = records.compactMap { record -> DesktopNotificationCanvas? in
             guard DesktopGeometry.isNotificationCenterCanvas(record.frame, layer: record.layer,
                 notificationCenter: context.notificationCenterPIDs.contains(record.pid), displays: displayFrames) else { return nil }
@@ -731,7 +791,7 @@ private enum DesktopCapture {
                 && SnowSurface.meetsWindowSupportSize(record.frame) && record.alpha >= 0.8
         }
         let activeID = DesktopGeometry.activeWindowID(
-            ordered: records.filter(isOrdinary).map { (id: $0.id, pid: $0.pid) }, frontmostPID: context.frontmostPID)
+            ordered: records.filter(isOrdinary).map { (id: $0.id, pid: $0.pid) }, frontmostPID: context.frontmost.pid)
         for record in records {
             if screenshotOwners.contains(record.pid) { continue }
             if notificationCanvasIDs.contains(record.id) {
@@ -817,7 +877,8 @@ private enum DesktopCapture {
                                windowCount: surfaces.filter { $0.kind == .window }.count,
                                captureMilliseconds: (ProcessInfo.processInfo.systemUptime - start) * 1000,
                                hiddenWindowSupportIDs: hiddenSupportIDs,
-                               screenshotSelectionActive: !screenshotOwners.isEmpty),
+                               screenshotSelectionActive: !screenshotOwners.isEmpty,
+                               missionControlActive: missionControlActive),
                                     hasWindowMetadata: true, windowSupports: windowSupports)
     }
 
@@ -834,6 +895,13 @@ private enum DesktopCapture {
 
 /// Pure bounds rules, independent of WindowServer and Accessibility permission.
 enum DesktopGeometry {
+    /// This is a WindowServer geometry heuristic, not an OS-provided mode flag.
+    static func isMissionControlWindow(_ frame: CGRect, layer: Int, windowManager: Bool,
+                                       displays: [CGRect]) -> Bool {
+        let dockLevel = Int(CGWindowLevelForKey(.dockWindow))
+        guard windowManager && layer == dockLevel - 1 else { return false }
+        return displays.contains { coversDisplay(frame, $0) }
+    }
     static func windowSupportID(pid: pid_t, id: UInt32) -> String { "window:\(pid):\(id)" }
 
     static func survivingWindowSupports(_ previous: [UInt32: pid_t], in inventory: [[String: Any]]) -> [UInt32: pid_t] {

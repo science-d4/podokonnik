@@ -334,6 +334,9 @@ enum DuckWorldTests {
         snapshot([enlarged, floor], changing: true, at: 4.02)
         check(on.snow.drifts[window.id]?.surface.isVisible == false, "transient resized return stays hidden")
         snapshot([enlarged, floor], changing: true, at: 4.12)
+        check(on.snow.drifts[window.id]?.surface.isVisible == false,
+              "the resized return remains hidden during the protection interval")
+        snapshot([enlarged, floor], changing: true, at: 4.33)
         check(on.snow.drifts[window.id]?.surface.frame == enlarged.frame
               && on.snow.drifts[window.id]?.surface.isVisible == true && on.duck.prints.isEmpty,
               "a stable resized return restores snow and discards the old duck effects")
